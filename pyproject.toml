@@ -1,0 +1,58 @@
+[project]
+name = "simple-rl-for-llms"
+version = "0.1.0"
+description = "A collection of training scripts for implementing reinforcement learning algorithms (GRPO, PPO, REINFORCE) to fine-tune large language models, built from scratch for educational purposes."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "transformers",
+    "typer",
+    "gem-llm",
+    "torch>=2.8.0",
+    "tqdm",
+    "wandb>=0.23.1",
+    "accelerate",
+]
+
+[dependency-groups]
+cuda = [
+    "accelerate>=1.13.0",
+]
+dev = [
+    "pytest>=8.4.2",
+    "ruff>=0.14.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# Enable these rule sets
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort (import sorting)
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "ARG", # flake8-unused-arguments
+    "SIM", # flake8-simplify
+]
+
+# Disable specific rules
+ignore = [
+    "E501",  # Line too long (handled by formatter)
+    "B008",  # Do not perform function call in argument defaults
+    "W191",  # Indentation contains tabs
+]
+
+# Allow autofix for all enabled rules
+fixable = ["ALL"]
+unfixable = []

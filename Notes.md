@@ -1,0 +1,7 @@
+- Loss masking is annoying and very easy to get wrong
+    - Need to ignore system prompt / first message
+    - But in multi-turn envs that is not enough!
+- System prompt and user message matter a lot
+    - For smaller models, a bad initial prompt can basically kill training
+    - Answer formatting in particular can be hard for smaller models, although I think most are mid-trained to learn the \\boxed{} format nowadays
+    - Maybe removing some zero reward completions would help - I didn't tried it though
