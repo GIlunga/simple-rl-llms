@@ -18,8 +18,8 @@ def print_masked_sequence(
     mask: torch.Tensor,
     tokenizer,
     *,
-    terminated: bool,
-    truncated: bool,
+    won: bool,
+    turn_count: int,
     reward: float,
 ) -> None:
     text = Text()
@@ -27,15 +27,42 @@ def print_masked_sequence(
         decoded = tokenizer.decode([tok]).replace("\n", "↵")
         text.append(decoded, style="bold green" if m else "dim")
 
-    term_style = "green" if terminated else "red"
-    trunc_style = "green" if truncated else "red"
-    reward_style = "green" if reward > 0 else "red"
+    won_style = "green" if won else "red"
+    reward_style = "green" if reward >= 1.0 else ("yellow" if reward > 0 else "red")
     title = (
-        f"terminated=[{term_style}]{terminated}[/]  "
-        f"truncated=[{trunc_style}]{truncated}[/]  "
-        f"reward=[{reward_style}]{round(reward, 2)}[/]"
+        f"[white]won=[/][{won_style}]{won}[/]  "
+        f"[white]turns={turn_count}[/]  "
+        f"[white]reward=[/][{reward_style}]{round(reward, 2)}[/]"
     )
     Console().print(Panel(text, title=title, border_style="bright_black"))
+
+
+def print_rollouts(
+    token_seqs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    attn_mask: torch.Tensor,
+    rewards: torch.Tensor,
+    won_lst: list[bool],
+    turn_count_lst: list[int],
+    tokenizer,
+    num_completions_per_prompt: int,
+) -> None:
+    console = Console()
+    num_prompts = len(won_lst) // num_completions_per_prompt
+    for prompt_idx in range(num_prompts):
+        console.rule(f"[bold]Prompt {prompt_idx + 1}[/]")
+        start = prompt_idx * num_completions_per_prompt
+        end = start + num_completions_per_prompt
+        for i in range(start, end):
+            real_len = attn_mask[i].sum().item()
+            print_masked_sequence(
+                token_seqs[i, :real_len],
+                loss_mask[i, :real_len],
+                tokenizer,
+                won=won_lst[i],
+                turn_count=turn_count_lst[i],
+                reward=rewards[i].item(),
+            )
 
 
 def generate_single_rollout(env, model, tokenizer, max_rollout_tokens):
@@ -106,7 +133,7 @@ def generate_single_rollout(env, model, tokenizer, max_rollout_tokens):
         prev_len = inputs["input_ids"].shape[1]
 
     mask = torch.tensor(output_mask)
-    return output_dict.sequences.detach().cpu(), mask, reward, terminated, truncated
+    return output_dict.sequences.detach().cpu(), mask, reward, reward == 1.0, env.turn_count
 
 
 def get_rollouts(
@@ -117,8 +144,8 @@ def get_rollouts(
     output_mask_lst = []
     reward_lst = []
     advantage_lst = []
-    terminated_lst = []
-    truncated_lst = []
+    won_lst = []
+    turn_count_lst = []
 
     for _ in range(num_prompts_per_step):
         base_env.reset()
@@ -127,15 +154,15 @@ def get_rollouts(
         env_copies = [deepcopy(base_env) for _ in range(num_completions_per_prompt)]
         group_rewards = []
         for env in env_copies:
-            token_seq, output_mask, reward, terminated, truncated = generate_single_rollout(
+            token_seq, output_mask, reward, won, turn_count = generate_single_rollout(
                 env, policy_model, tokenizer, max_rollout_tokens
             )
 
             token_seq_lst.append(token_seq.squeeze())
             output_mask_lst.append(output_mask)
             group_rewards.append(reward)
-            terminated_lst.append(terminated)
-            truncated_lst.append(truncated)
+            won_lst.append(won)
+            turn_count_lst.append(turn_count)
 
         group_rewards = torch.tensor(group_rewards)
         advantages = (group_rewards - group_rewards.mean()) / (group_rewards.std() + 1e-8)
@@ -151,16 +178,7 @@ def get_rollouts(
     loss_mask &= attn_mask
 
     all_rewards = torch.cat(reward_lst)
-    for i in range(len(token_seq_lst)):
-        real_len = attn_mask[i].sum().item()
-        print_masked_sequence(
-            token_seqs[i, :real_len],
-            loss_mask[i, :real_len],
-            tokenizer,
-            terminated=terminated_lst[i],
-            truncated=truncated_lst[i],
-            reward=all_rewards[i].item(),
-        )
+    print_rollouts(token_seqs, loss_mask, attn_mask, all_rewards, won_lst, turn_count_lst, tokenizer, num_completions_per_prompt)
 
     return token_seqs, loss_mask, attn_mask, all_rewards, torch.cat(advantage_lst)
 
