@@ -9,3 +9,8 @@
     - For smaller models, a bad initial prompt can basically kill training
     - Answer formatting in particular can be hard for smaller models, although I think most are mid-trained to learn the \\boxed{} format nowadays
     - Maybe removing some zero reward completions would help - I didn't tried it though
+- Step size and batch size need to managed right
+    - We want a step to be N prompts with K completions (NxK)
+    - But maybe our batch can only hold, e.g., Nxk / 5 sequences
+    - Need to automatically accumulate gradient, to equal single optimization step!
+    - Tricky to normalize correctly: original GRPO needs to normlize each completion by its sequence length, then by G. However, with a batch containing multiple prompts, we should normalize by PxG

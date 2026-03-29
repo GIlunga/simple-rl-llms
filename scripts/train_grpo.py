@@ -1,12 +1,9 @@
 import logging
-import sys
-import traceback
 from copy import deepcopy
 
 import torch
 import torch.nn.functional as F
 import typer
-import wandb
 from gem.envs.game_env.guess_the_number import GuessTheNumberEnv
 from rich.console import Console
 from rich.text import Text
@@ -142,14 +139,6 @@ def get_rollouts(
     return token_seqs, loss_mask, attn_mask, torch.cat(reward_lst), torch.cat(advantage_lst)
 
 
-def init_wandb(**args):
-    return wandb.init(
-        entity="gilunga-personal",
-        project="Simple RL for LLMs",
-        config=args,
-    )
-
-
 def train_grpo(
     model_name: str = "Qwen/Qwen3.5-0.8B",
     num_steps: int = 4,
@@ -160,16 +149,10 @@ def train_grpo(
     learning_rate: float = 1e-5,  # TODO: check what is usually used
     per_device_batch_size: int = 2,  # TODO: only supporting single device for now
     max_tokens_per_turn: int = 256,
-    gradient_accumulation_batches: int = 1,
-    log_to_wandb: bool = False,
 ):
-    # TODO: log some completions
     # TODO: max_rollout_tokens is actually max_tokens per turn
     # TODO: need to double check if generation only tokens or not
     # TODO: add gradient clipping
-    wandb_run = init_wandb(**locals()) if log_to_wandb else None
-    # It adds a rich hook that prints locals() on each exception which is annoying
-    sys.excepthook = lambda *args: traceback.print_exception(*args)
 
     policy_model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -179,7 +162,7 @@ def train_grpo(
 
     base_env = GuessTheNumberEnv(min_number=1, max_number=10, max_turns=5)
 
-    # TODO: warmup
+    # TODO: warmup?
     optimizer = torch.optim.AdamW(policy_model.parameters(), learning_rate)
 
     # TODO: ignoring KL and reference model for now
@@ -199,16 +182,13 @@ def train_grpo(
         num_batches = (total_size + per_device_batch_size - 1) // per_device_batch_size
 
         # Train multiple times on the same batch
-        # TODO: I think gradient accumulation logic is wrong
         for iteration_in_step in range(num_iterations_per_step):
             acc_loss = 0.0
 
             # TODO: missing logprobs for importance sampling!
 
+            optimizer.zero_grad()
             for batch_idx in range(num_batches):
-                if batch_idx % gradient_accumulation_batches == 0:
-                    optimizer.zero_grad()
-
                 # Get batch data
                 start_idx = batch_idx * per_device_batch_size
                 end_idx = (batch_idx + 1) * per_device_batch_size
@@ -234,19 +214,18 @@ def train_grpo(
                 # Shift mask by 1 to match logprobs
                 shifted_loss_mask = batch_loss_mask[:, 1:]
                 per_token_obj = logprobs * shifted_loss_mask * batch_advantages.unsqueeze(-1)
-                num_tokens = shifted_loss_mask.sum()
 
-                # Normalize by number of tokens to get per-token objective
-                policy_gradient_obj = per_token_obj.sum() / num_tokens
-
-                loss = -policy_gradient_obj / gradient_accumulation_batches
+                # GRPO paper normalisation: normalise each completion by its own length, mean over P*G completions.
+                # Dividing each mini-batch contribution by total_completions and accumulating gives
+                # the same gradient as processing the full batch in one forward pass.
+                seq_lengths = shifted_loss_mask.sum(dim=1)
+                seq_objs = per_token_obj.sum(dim=1) / seq_lengths
+                loss = -seq_objs.sum() / total_size
                 loss.backward()
 
                 acc_loss += loss.item()
 
-                # Step optimizer after accumulating enough gradients or in last batch
-                if (batch_idx + 1) % gradient_accumulation_batches == 0 or (batch_idx + 1) == num_batches:
-                    optimizer.step()
+            optimizer.step()
 
             # Calculate metrics
             # TODO: no need to repeat rewards on each iteration
@@ -257,26 +236,13 @@ def train_grpo(
             null_or_format_rewards = 100 * (rewards <= 0).sum().item() / total_size
 
             tqdm.write(
-                f"Step {global_step}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_proportion={null_or_format_rewards:.2f}, reward_std={reward_std:.2f}"
+                f"Step {global_step}, iteration {iteration_in_step}/{num_iterations_per_step}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_proportion={null_or_format_rewards:.2f}, reward_std={reward_std:.2f}"
             )
 
-            if wandb_run:
-                wandb_run.log(
-                    {
-                        "avg_loss": avg_loss,
-                        "rewards": avg_reward,
-                        "reward_std": reward_std,
-                        "zero_reward_proportion": null_or_format_rewards,
-                    },
-                    step=global_step,
-                )
 
             # TODO: log gradient norm, a sample completion to the terminal once in a while, checkpoints
 
         # TODO: reference model KL
-    if wandb_run:
-        wandb_run.finish()
-
 
 if __name__ == "__main__":
     typer.run(train_grpo)
