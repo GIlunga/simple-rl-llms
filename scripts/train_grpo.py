@@ -6,24 +6,39 @@ import torch.nn.functional as F
 import typer
 from gem.envs.game_env.guess_the_number import GuessTheNumberEnv
 from rich.console import Console
+from rich.panel import Panel
 from rich.text import Text
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-def print_masked_sequence(sequences: torch.Tensor, mask: torch.Tensor, tokenizer) -> None:
+def print_masked_sequence(
+    sequences: torch.Tensor,
+    mask: torch.Tensor,
+    tokenizer,
+    *,
+    terminated: bool,
+    truncated: bool,
+    reward: float,
+) -> None:
     text = Text()
     for tok, m in zip(sequences.tolist(), mask.tolist(), strict=True):
         decoded = tokenizer.decode([tok]).replace("\n", "↵")
-        if m:
-            text.append(decoded, style="bold green")
-        else:
-            text.append(decoded, style="dim")
-    Console().print(text)
+        text.append(decoded, style="bold green" if m else "dim")
+
+    term_style = "green" if terminated else "red"
+    trunc_style = "green" if truncated else "red"
+    reward_style = "green" if reward > 0 else "red"
+    title = (
+        f"terminated=[{term_style}]{terminated}[/]  "
+        f"truncated=[{trunc_style}]{truncated}[/]  "
+        f"reward=[{reward_style}]{round(reward, 2)}[/]"
+    )
+    Console().print(Panel(text, title=title, border_style="bright_black"))
 
 
-def generate_single_rollout(env, model, tokenizer, max_rollout_tokens, n) -> tuple[torch.Tensor, int, float]:
+def generate_single_rollout(env, model, tokenizer, max_rollout_tokens):
     message_list = [
         {
             "content": "You are playing Guess The Number with the user. You have to guess the number between 1 and 10 (inclusive) within 5 turns. As you enter your guess, the user will provide you with hints such as the target number is 'higher' or 'lower'. When answering, only the number that is wrapped inside \\boxed{} will be considered as your guess, for example, \\boxed{10}. Follow that exact format for your final answer.",
@@ -90,13 +105,8 @@ def generate_single_rollout(env, model, tokenizer, max_rollout_tokens, n) -> tup
         output_mask += [False] * (inputs["input_ids"].shape[1] - output_dict.sequences.shape[1])
         prev_len = inputs["input_ids"].shape[1]
 
-    sequences = output_dict.sequences[0]
     mask = torch.tensor(output_mask)
-    print()
-    print(f"{terminated=}")
-    print(f"{truncated=}")
-    print_masked_sequence(sequences, mask, tokenizer)
-    return output_dict.sequences.detach().cpu(), mask, reward
+    return output_dict.sequences.detach().cpu(), mask, reward, terminated, truncated
 
 
 def get_rollouts(
@@ -107,6 +117,8 @@ def get_rollouts(
     output_mask_lst = []
     reward_lst = []
     advantage_lst = []
+    terminated_lst = []
+    truncated_lst = []
 
     for _ in range(num_prompts_per_step):
         base_env.reset()
@@ -114,14 +126,16 @@ def get_rollouts(
         # env copies share same target number
         env_copies = [deepcopy(base_env) for _ in range(num_completions_per_prompt)]
         group_rewards = []
-        for i, env in enumerate(env_copies):
-            token_seq, output_mask, reward = generate_single_rollout(
-                env, policy_model, tokenizer, max_rollout_tokens, i
+        for env in env_copies:
+            token_seq, output_mask, reward, terminated, truncated = generate_single_rollout(
+                env, policy_model, tokenizer, max_rollout_tokens
             )
 
             token_seq_lst.append(token_seq.squeeze())
             output_mask_lst.append(output_mask)
             group_rewards.append(reward)
+            terminated_lst.append(terminated)
+            truncated_lst.append(truncated)
 
         group_rewards = torch.tensor(group_rewards)
         advantages = (group_rewards - group_rewards.mean()) / (group_rewards.std() + 1e-8)
@@ -136,7 +150,19 @@ def get_rollouts(
     loss_mask = torch.nn.utils.rnn.pad_sequence(output_mask_lst, batch_first=True, padding_value=False)
     loss_mask &= attn_mask
 
-    return token_seqs, loss_mask, attn_mask, torch.cat(reward_lst), torch.cat(advantage_lst)
+    all_rewards = torch.cat(reward_lst)
+    for i in range(len(token_seq_lst)):
+        real_len = attn_mask[i].sum().item()
+        print_masked_sequence(
+            token_seqs[i, :real_len],
+            loss_mask[i, :real_len],
+            tokenizer,
+            terminated=terminated_lst[i],
+            truncated=truncated_lst[i],
+            reward=all_rewards[i].item(),
+        )
+
+    return token_seqs, loss_mask, attn_mask, all_rewards, torch.cat(advantage_lst)
 
 
 def train_grpo(
