@@ -6,13 +6,24 @@ from copy import deepcopy
 import torch
 import torch.nn.functional as F
 import typer
+import wandb
 from gem.envs.game_env.guess_the_number import GuessTheNumberEnv
+from rich.console import Console
+from rich.text import Text
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import wandb
-
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+def print_masked_sequence(sequences: torch.Tensor, mask: torch.Tensor, tokenizer) -> None:
+    text = Text()
+    for tok, m in zip(sequences.tolist(), mask.tolist(), strict=True):
+        decoded = tokenizer.decode([tok]).replace("\n", "↵")
+        if m:
+            text.append(decoded, style="bold green")
+        else:
+            text.append(decoded, style="dim")
+    Console().print(text)
 
 
 def generate_single_rollout(env, model, tokenizer, max_rollout_tokens, n) -> tuple[torch.Tensor, int, float]:
@@ -29,39 +40,66 @@ def generate_single_rollout(env, model, tokenizer, max_rollout_tokens, n) -> tup
     terminated = False
     truncated = False
 
-    inputs = tokenizer.apply_chat_template(message_list, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(inputs, return_tensors="pt").to(model.device)
-    first_input_len = inputs["input_ids"].shape[1]
+    # Thinking = False adds a thinking section and closes it immediately
+    inputs_text = tokenizer.apply_chat_template(
+        message_list, tokenize=False, enable_thinking=False, add_generation_prompt=True
+    )
 
+    inputs = tokenizer(inputs_text, return_tensors="pt").to(model.device)
+    prev_len = inputs["input_ids"].shape[1]
+    output_mask = [False] * prev_len  # Mask out system prompt + special tokens
+    ENDOFTEXT_TOKEN_ID = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    im_end_token = tokenizer.convert_tokens_to_ids("<|im_end|>")
     # Iterate multi-step env
-    while not terminated and not truncated:
+    while True:
         with torch.inference_mode():
-            output_tokens = model.generate(
+            output_dict = model.generate(
                 **inputs,
                 max_new_tokens=max_rollout_tokens,
                 temperature=1.0,
                 do_sample=True,
+                return_dict_in_generate=True,
                 pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=[tokenizer.eos_token_id, im_end_token]
             )
 
+        # Strip end of text
+        if output_dict.sequences[0][-1] == ENDOFTEXT_TOKEN_ID:
+            output_dict.sequences = output_dict.sequences[:, :-1]
+
         # Env step
-        text_response = tokenizer.decode(output_tokens[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True)
+        text_response = tokenizer.decode(output_dict.sequences[0][prev_len:], skip_special_tokens=True)
         observation, reward, terminated, truncated, _ = env.step(text_response)
 
+
+        # Update mask with model response
+        output_mask += [True] * (output_dict.sequences.shape[1] - prev_len)
+
         # Add new text
-        message_list.extend([{"role": "assistant", "content": text_response}, {"role": "user", "content": observation}])
+        observation_msg = {"role": "user", "content": observation}
+        message_list.extend([{"role": "assistant", "content": text_response}, observation_msg])
 
-        # TODO: Can we avoid re-tokenizing the previous text
-        inputs = tokenizer.apply_chat_template(message_list, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(inputs, return_tensors="pt").to(model.device)
+        if terminated or truncated:
+            break
 
-    if n < 4:
-        print("---")
-        print(message_list)
-        print(env.game_number)
-        print()
+        new_inputs = tokenizer.apply_chat_template([observation_msg], tokenize=False, add_generation_prompt=True)
 
-    return output_tokens.detach().cpu(), first_input_len, reward
+        new_inputs = tokenizer(new_inputs, return_tensors="pt").to(model.device)
+
+        inputs["input_ids"] = torch.cat([output_dict.sequences, new_inputs["input_ids"]], dim=1)
+        inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+
+        # Update mask to ignore observation and assistant start token
+        output_mask += [False] * (inputs["input_ids"].shape[1] - output_dict.sequences.shape[1])
+        prev_len = inputs["input_ids"].shape[1]
+
+    sequences = output_dict.sequences[0]
+    mask = torch.tensor(output_mask)
+    print()
+    print(f"{terminated=}")
+    print(f"{truncated=}")
+    print_masked_sequence(sequences, mask, tokenizer)
+    return output_dict.sequences.detach().cpu(), mask, reward
 
 
 def get_rollouts(
@@ -69,7 +107,7 @@ def get_rollouts(
 ):
     """Simple sequential multiple rollout generation for multiple prompts. No batching"""
     token_seq_lst = []
-    initial_input_len_lst = []
+    output_mask_lst = []
     reward_lst = []
     advantage_lst = []
 
@@ -80,12 +118,12 @@ def get_rollouts(
         env_copies = [deepcopy(base_env) for _ in range(num_completions_per_prompt)]
         group_rewards = []
         for i, env in enumerate(env_copies):
-            token_seq, initial_input_len, reward = generate_single_rollout(
+            token_seq, output_mask, reward = generate_single_rollout(
                 env, policy_model, tokenizer, max_rollout_tokens, i
             )
 
             token_seq_lst.append(token_seq.squeeze())
-            initial_input_len_lst.append(initial_input_len)
+            output_mask_lst.append(output_mask)
             group_rewards.append(reward)
 
         group_rewards = torch.tensor(group_rewards)
@@ -95,11 +133,10 @@ def get_rollouts(
         advantage_lst.append(advantages)
 
     # shape: B x T
-    # TODO: Incorrect loss mask - multi turn env so the observations need to be masked!
     token_seqs = torch.nn.utils.rnn.pad_sequence(token_seq_lst, batch_first=True, padding_value=tokenizer.pad_token_id)
     attn_mask = token_seqs != tokenizer.pad_token_id
-    positions = torch.arange(token_seqs.shape[1], device="cpu")
-    loss_mask = positions >= torch.tensor(initial_input_len_lst).unsqueeze(-1)
+
+    loss_mask = torch.nn.utils.rnn.pad_sequence(output_mask_lst, batch_first=True, padding_value=False)
     loss_mask &= attn_mask
 
     return token_seqs, loss_mask, attn_mask, torch.cat(reward_lst), torch.cat(advantage_lst)
@@ -115,9 +152,9 @@ def init_wandb(**args):
 
 def train_grpo(
     model_name: str = "Qwen/Qwen3.5-0.8B",
-    num_steps: int = 2,
+    num_steps: int = 4,
     num_prompts_per_step: int = 1,
-    num_completions_per_prompt: int = 4,
+    num_completions_per_prompt: int = 8,
     num_iterations_per_step: int = 1,  # Train multiple times on same data (iterative GRPO in R1)
     ref_model_sync_every_n_steps: int = 4,
     learning_rate: float = 1e-5,  # TODO: check what is usually used
@@ -138,7 +175,7 @@ def train_grpo(
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token = tokenizer.convert_tokens_to_ids("<|endoftext|>")
 
     base_env = GuessTheNumberEnv(min_number=1, max_number=10, max_turns=5)
 

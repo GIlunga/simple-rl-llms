@@ -1,6 +1,10 @@
 - Loss masking is annoying and very easy to get wrong
     - Need to ignore system prompt / first message
     - But in multi-turn envs that is not enough!
+    - Example of tricky bug:
+        - first turn makes sense
+        - second turn model print \boxed{5)
+        - cause: pad_token was none, we set it to eos_token, attn mask = seq != pad_token, so we never attend to eos_token!
 - System prompt and user message matter a lot
     - For smaller models, a bad initial prompt can basically kill training
     - Answer formatting in particular can be hard for smaller models, although I think most are mid-trained to learn the \\boxed{} format nowadays
