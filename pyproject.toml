@@ -1,3 +1,4 @@
+
 [project]
 name = "simple-rl-for-llms"
 version = "0.1.0"
@@ -12,6 +13,7 @@ dependencies = [
     "tqdm",
     "wandb>=0.23.1",
     "accelerate",
+    "modal>=1.4.2",
 ]
 
 [dependency-groups]
@@ -27,7 +29,6 @@ dev = [
 name = "pytorch"
 url = "https://download.pytorch.org/whl/cu121"
 explicit = true
-
 [tool.ruff]
 line-length = 120
 target-version = "py312"

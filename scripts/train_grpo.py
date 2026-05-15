@@ -1,6 +1,7 @@
 import logging
 from copy import deepcopy
 
+import modal
 import torch
 import torch.nn.functional as F
 import typer
@@ -11,7 +12,23 @@ from rich.text import Text
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+
+def download_models():
+    # Helper for Modal image
+    from huggingface_hub import snapshot_download
+
+    snapshot_download("Qwen/Qwen3.5-0.8B")
+
+
+image = (
+    modal.Image.debian_slim()
+    .uv_sync()
+    .run_function(download_models, secrets=[modal.Secret.from_name("huggingface-secret")])
+)
+app = modal.App("llm-rl-test", image=image)
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 def print_masked_sequence(
     sequences: torch.Tensor,
@@ -99,7 +116,7 @@ def generate_single_rollout(env, model, tokenizer, max_rollout_tokens):
                 do_sample=True,
                 return_dict_in_generate=True,
                 pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=[tokenizer.eos_token_id, im_end_token]
+                eos_token_id=[tokenizer.eos_token_id, im_end_token],
             )
 
         # Strip end of text
@@ -109,7 +126,6 @@ def generate_single_rollout(env, model, tokenizer, max_rollout_tokens):
         # Env step
         text_response = tokenizer.decode(output_dict.sequences[0][prev_len:], skip_special_tokens=True)
         observation, reward, terminated, truncated, _ = env.step(text_response)
-
 
         # Update mask with model response
         output_mask += [True] * (output_dict.sequences.shape[1] - prev_len)
@@ -178,21 +194,24 @@ def get_rollouts(
     loss_mask &= attn_mask
 
     all_rewards = torch.cat(reward_lst)
-    print_rollouts(token_seqs, loss_mask, attn_mask, all_rewards, won_lst, turn_count_lst, tokenizer, num_completions_per_prompt)
+    print_rollouts(
+        token_seqs, loss_mask, attn_mask, all_rewards, won_lst, turn_count_lst, tokenizer, num_completions_per_prompt
+    )
 
     return token_seqs, loss_mask, attn_mask, all_rewards, torch.cat(advantage_lst)
 
 
+@app.function(gpu="T4", timeout=300, secrets=[modal.Secret.from_name("huggingface-secret")])
 def train_grpo(
     model_name: str = "Qwen/Qwen3.5-0.8B",
     num_steps: int = 4,
     num_prompts_per_step: int = 1,
-    num_completions_per_prompt: int = 8,
+    num_completions_per_prompt: int = 4,
     num_iterations_per_step: int = 1,  # Train multiple times on same data (iterative GRPO in R1)
     ref_model_sync_every_n_steps: int = 4,
     learning_rate: float = 1e-5,  # TODO: check what is usually used
     per_device_batch_size: int = 2,  # TODO: only supporting single device for now
-    max_tokens_per_turn: int = 256,
+    max_tokens_per_turn: int = 128,
 ):
     # TODO: max_rollout_tokens is actually max_tokens per turn
     # TODO: need to double check if generation only tokens or not
@@ -283,10 +302,10 @@ def train_grpo(
                 f"Step {global_step}, iteration {iteration_in_step}/{num_iterations_per_step}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_proportion={null_or_format_rewards:.2f}, reward_std={reward_std:.2f}"
             )
 
-
             # TODO: log gradient norm, a sample completion to the terminal once in a while, checkpoints
 
         # TODO: reference model KL
+
 
 if __name__ == "__main__":
     typer.run(train_grpo)
