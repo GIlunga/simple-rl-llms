@@ -14,3 +14,4 @@
     - But maybe our batch can only hold, e.g., Nxk / 5 sequences
     - Need to automatically accumulate gradient, to equal single optimization step!
     - Tricky to normalize correctly: original GRPO needs to normlize each completion by its sequence length, then by G. However, with a batch containing multiple prompts, we should normalize by PxG
+- Schulman unbiased estimator of KL
