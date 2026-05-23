@@ -19,7 +19,6 @@ def download_models():
 
     snapshot_download("Qwen/Qwen3.5-0.8B")
 
-
 image = (
     modal.Image.debian_slim()
     .uv_sync()
@@ -209,7 +208,7 @@ def train_grpo(
     num_completions_per_prompt: int = 4,
     num_iterations_per_step: int = 1,  # Train multiple times on same data (iterative GRPO in R1)
     ref_model_sync_every_n_steps: int = 4,
-    learning_rate: float = 1e-5,  # TODO: check what is usually used
+    learning_rate: float = 1e-5,
     per_device_batch_size: int = 2,  # TODO: only supporting single device for now
     max_tokens_per_turn: int = 128,
 ):
