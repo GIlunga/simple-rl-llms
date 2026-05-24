@@ -220,15 +220,13 @@ def train_grpo(
     num_steps: int = 4,
     num_prompts_per_step: int = 1,
     num_completions_per_prompt: int = 4,
-    num_iterations_per_step: int = 1,  # Train multiple times on same data (iterative GRPO in R1)
-    ref_model_sync_every_n_steps: int = -1,  # TODO: unused, frozen reference for now
+    num_iterations_per_step: int = 1,
+    ref_model_sync_every_n_steps: int = 2,
     kl_beta: float = 0.05,
     learning_rate: float = 1e-5,
     per_device_batch_size: int = 2,  # TODO: only supporting single device for now
     max_tokens_per_turn: int = 128,
 ):
-    # TODO: max_rollout_tokens is actually max_tokens per turn
-    # TODO: need to double check if generation only tokens or not
     # TODO: add gradient clipping
     # TODO: add importance sampling
 
@@ -246,6 +244,11 @@ def train_grpo(
     optimizer = torch.optim.AdamW(policy_model.parameters(), learning_rate)
 
     for step in tqdm(range(num_steps), desc="Training", unit="step"):
+        if ref_model_sync_every_n_steps > 1 and ((step + 1) % ref_model_sync_every_n_steps) == 0:
+            print("Syncing reference model")
+            # TODO: maybe inneficient or doesn't free up all memory
+            reference_model = deepcopy(policy_model).eval()
+
         # Generate dataset for this step (num_prompts * num_completions_per_prompt)
         token_seqs, loss_mask, attn_mask, rewards, advantages = get_rollouts(
             base_env, policy_model, tokenizer, max_tokens_per_turn, num_prompts_per_step, num_completions_per_prompt
@@ -306,6 +309,7 @@ def train_grpo(
                 loss = -seq_objs.sum() / total_size
                 loss.backward()
 
+                # TODO: accumulate loss components (kl term separate)
                 acc_loss += loss.item()
 
             optimizer.step()
@@ -318,12 +322,13 @@ def train_grpo(
             reward_std = rewards.std().item()
             null_or_format_rewards = 100 * (rewards <= 0).sum().item() / total_size
 
-            tqdm.write(
+            print(
                 f"Step {global_step}, iteration {iteration_in_step}/{num_iterations_per_step}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_proportion={null_or_format_rewards:.2f}, reward_std={reward_std:.2f}"
             )
 
             # TODO: log gradient norm, save checkpoints
 
 
+# TODO: doesn't work with modal
 if __name__ == "__main__":
     typer.run(train_grpo)
