@@ -4,7 +4,6 @@ from copy import deepcopy
 import modal
 import torch
 import torch.nn.functional as F
-import typer
 from gem.envs.game_env.guess_the_number import GuessTheNumberEnv
 from rich.console import Console
 from rich.panel import Panel
@@ -12,23 +11,25 @@ from rich.text import Text
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+MODEL_NAME = "Qwen/Qwen3.5-0.8B"
+GPU = "T4"
+DTYPE = torch.float16
+TIMEOUT = 300  # seconds
 
 def download_models():
-    # Helper for Modal image
+    # Helper for Modal image caching
     from huggingface_hub import snapshot_download
 
-    snapshot_download("Qwen/Qwen3.5-0.8B")
+    snapshot_download(MODEL_NAME)
 
-
+triton_volume = modal.Volume.from_name("triton-cache", create_if_missing=True)
 image = (
-    modal.Image.debian_slim()
+    modal.Image.from_registry("nvidia/cuda:12.6.0-devel-ubuntu22.04", add_python="3.12")
+    .apt_install("build-essential", "clang")
     .uv_sync()
     .run_function(download_models, secrets=[modal.Secret.from_name("huggingface-secret")])
 )
 app = modal.App("llm-rl-test", image=image)
-
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
 
 def print_masked_sequence(
     sequences: torch.Tensor,
@@ -114,6 +115,7 @@ def generate_single_rollout(env, model, tokenizer, max_rollout_tokens):
                 max_new_tokens=max_rollout_tokens,
                 temperature=1.0,
                 do_sample=True,
+                use_cache=True,
                 return_dict_in_generate=True,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=[tokenizer.eos_token_id, im_end_token],
@@ -214,26 +216,26 @@ def get_logprobs_from_logits(model_output, targets):
     )
 
 
-@app.function(gpu="T4", timeout=300, secrets=[modal.Secret.from_name("huggingface-secret")])
+@app.function(gpu=GPU, timeout=TIMEOUT, secrets=[modal.Secret.from_name("huggingface-secret")],volumes={"/root/.triton": triton_volume})
 def train_grpo(
-    model_name: str = "Qwen/Qwen3.5-0.8B",
     num_steps: int = 4,
     num_prompts_per_step: int = 1,
-    num_completions_per_prompt: int = 4,
+    num_completions_per_prompt: int = 2,
     num_iterations_per_step: int = 1,
     ref_model_sync_every_n_steps: int = 2,
     kl_beta: float = 0.05,
     learning_rate: float = 1e-5,
     per_device_batch_size: int = 2,  # TODO: only supporting single device for now
-    max_tokens_per_turn: int = 128,
+    max_tokens_per_turn: int = 32,
 ):
     # TODO: add gradient clipping
     # TODO: add importance sampling
+    policy_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME, device_map="cuda", dtype=DTYPE
+    )
+    reference_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="cuda", dtype=DTYPE).eval()
 
-    policy_model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda")
-    reference_model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda").eval()
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.convert_tokens_to_ids("<|endoftext|>")
@@ -246,8 +248,7 @@ def train_grpo(
     for step in tqdm(range(num_steps), desc="Training", unit="step"):
         if ref_model_sync_every_n_steps > 1 and ((step + 1) % ref_model_sync_every_n_steps) == 0:
             print("Syncing reference model")
-            # TODO: maybe inneficient or doesn't free up all memory
-            reference_model = deepcopy(policy_model).eval()
+            reference_model.load_state_dict(policy_model.state_dict())
 
         # Generate dataset for this step (num_prompts * num_completions_per_prompt)
         token_seqs, loss_mask, attn_mask, rewards, advantages = get_rollouts(
@@ -280,10 +281,8 @@ def train_grpo(
 
                 # Shift mask by 1 to match logprobs
                 shifted_loss_mask = batch_loss_mask[:, 1:]
-
                 policy_model_output = policy_model.forward(batch_inputs, attention_mask=batch_attn_mask)
                 policy_model_logprobs = get_logprobs_from_logits(policy_model_output, targets) * shifted_loss_mask
-
                 with torch.inference_mode():
                     ref_model_output = reference_model.forward(batch_inputs, attention_mask=batch_attn_mask)
                 ref_model_logprobs = get_logprobs_from_logits(ref_model_output, targets) * shifted_loss_mask
@@ -327,8 +326,3 @@ def train_grpo(
             )
 
             # TODO: log gradient norm, save checkpoints
-
-
-# TODO: doesn't work with modal
-if __name__ == "__main__":
-    typer.run(train_grpo)
