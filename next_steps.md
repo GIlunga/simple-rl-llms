@@ -4,7 +4,9 @@
 - [x] Add reference model + KL penalty: policy diverges without a frozen reference model and KL regularization term.
 - [ ] Add gradient clipping (e.g., `max_grad_norm=1.0`) to prevent exploding gradients from large advantage values. Also add a counter/print for when the clipping happens
 - [x] Implement reference model sync
-- [ ] Improve logging to work on modal + add back wandb
+- [x] Improve logging to work on modal
+- [ ] Add back wandb
+- [ ] Add warmup
 - [ ] Fix max tokens per turn (rename variable)
 - [ ] Log KL
 - [ ] Add importance sampling

@@ -1,4 +1,3 @@
-import logging
 from copy import deepcopy
 
 import modal
@@ -10,19 +9,38 @@ from rich.panel import Panel
 from rich.text import Text
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import logging
+import warnings
 
+# Disable annoying prints
+warnings.filterwarnings("ignore", message=".*tl.make_block_ptr is deprecated.*")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Parameters
 MODEL_NAME = "Qwen/Qwen3.5-0.8B"
 GPU = "T4"
 DTYPE = torch.float16
 TIMEOUT = 300  # seconds
+NUM_STEPS = 1
+NUM_PROMPTS_PER_STEP = 1
+NUM_COMPLETIONS_PER_PROMPT = 2
+NUM_ITERATIONS_PER_STEP = 1
+REF_MODEL_SYNC_EVERY_N_STEPS = 2
+KL_BETA = 0.05
+LEARNING_RATE = 1e-5
+PER_DEVICE_BATCH_SIZE = 2
+MAX_TOKENS_PER_TURN = 32
 
+
+# Modal image definition
 def download_models():
     # Helper for Modal image caching
     from huggingface_hub import snapshot_download
 
     snapshot_download(MODEL_NAME)
 
-triton_volume = modal.Volume.from_name("triton-cache", create_if_missing=True)
+
+kernel_volume = modal.Volume.from_name("kernel-cache", create_if_missing=True)
 image = (
     modal.Image.from_registry("nvidia/cuda:12.6.0-devel-ubuntu22.04", add_python="3.12")
     .apt_install("build-essential", "clang")
@@ -31,6 +49,8 @@ image = (
 )
 app = modal.App("llm-rl-test", image=image)
 
+
+# Visualisation
 def print_masked_sequence(
     sequences: torch.Tensor,
     mask: torch.Tensor,
@@ -52,7 +72,7 @@ def print_masked_sequence(
         f"[white]turns={turn_count}[/]  "
         f"[white]reward=[/][{reward_style}]{round(reward, 2)}[/]"
     )
-    Console().print(Panel(text, title=title, border_style="bright_black"))
+    Console(force_terminal=True).print(Panel(text, title=title, border_style="bright_black"))
 
 
 def print_rollouts(
@@ -83,6 +103,7 @@ def print_rollouts(
             )
 
 
+# Actual GRPO algo
 def generate_single_rollout(env, model, tokenizer, max_rollout_tokens):
     message_list = [
         {
@@ -216,25 +237,15 @@ def get_logprobs_from_logits(model_output, targets):
     )
 
 
-@app.function(gpu=GPU, timeout=TIMEOUT, secrets=[modal.Secret.from_name("huggingface-secret")],volumes={"/root/.triton": triton_volume})
-def train_grpo(
-    num_steps: int = 4,
-    num_prompts_per_step: int = 1,
-    num_completions_per_prompt: int = 2,
-    num_iterations_per_step: int = 1,
-    ref_model_sync_every_n_steps: int = 2,
-    kl_beta: float = 0.05,
-    learning_rate: float = 1e-5,
-    per_device_batch_size: int = 2,  # TODO: only supporting single device for now
-    max_tokens_per_turn: int = 32,
-):
-    # TODO: add gradient clipping
-    # TODO: add importance sampling
-    policy_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, device_map="cuda", dtype=DTYPE
-    )
+@app.function(
+    gpu=GPU,
+    timeout=TIMEOUT,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    volumes={"/root/.triton": kernel_volume},
+)
+def train_grpo():
+    policy_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="cuda", dtype=DTYPE)
     reference_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="cuda", dtype=DTYPE).eval()
-
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     if tokenizer.pad_token is None:
@@ -242,36 +253,33 @@ def train_grpo(
 
     base_env = GuessTheNumberEnv(min_number=1, max_number=10, max_turns=5)
 
-    # TODO: warmup
-    optimizer = torch.optim.AdamW(policy_model.parameters(), learning_rate)
+    optimizer = torch.optim.AdamW(policy_model.parameters(), LEARNING_RATE)
 
-    for step in tqdm(range(num_steps), desc="Training", unit="step"):
-        if ref_model_sync_every_n_steps > 1 and ((step + 1) % ref_model_sync_every_n_steps) == 0:
+    for step in tqdm(range(NUM_STEPS), desc="Training", unit="step"):
+        if REF_MODEL_SYNC_EVERY_N_STEPS > 1 and ((step + 1) % REF_MODEL_SYNC_EVERY_N_STEPS) == 0:
             print("Syncing reference model")
             reference_model.load_state_dict(policy_model.state_dict())
 
         # Generate dataset for this step (num_prompts * num_completions_per_prompt)
         token_seqs, loss_mask, attn_mask, rewards, advantages = get_rollouts(
-            base_env, policy_model, tokenizer, max_tokens_per_turn, num_prompts_per_step, num_completions_per_prompt
+            base_env, policy_model, tokenizer, MAX_TOKENS_PER_TURN, NUM_PROMPTS_PER_STEP, NUM_COMPLETIONS_PER_PROMPT
         )
 
         policy_model.train()
 
         # Slice according to batch size per device (single device for now!)
         total_size, _ = token_seqs.shape
-        num_batches = (total_size + per_device_batch_size - 1) // per_device_batch_size
+        num_batches = (total_size + PER_DEVICE_BATCH_SIZE - 1) // PER_DEVICE_BATCH_SIZE
 
         # Train multiple times on the same batch
-        for iteration_in_step in range(num_iterations_per_step):
+        for iteration_in_step in range(NUM_ITERATIONS_PER_STEP):
             acc_loss = 0.0
-
-            # TODO: missing logprobs for importance sampling!
 
             optimizer.zero_grad()
             for batch_idx in range(num_batches):
                 # Get batch data
-                start_idx = batch_idx * per_device_batch_size
-                end_idx = (batch_idx + 1) * per_device_batch_size
+                start_idx = batch_idx * PER_DEVICE_BATCH_SIZE
+                end_idx = (batch_idx + 1) * PER_DEVICE_BATCH_SIZE
 
                 batch_inputs = token_seqs[start_idx:end_idx].cuda()
                 batch_attn_mask = attn_mask[start_idx:end_idx].cuda()
@@ -298,7 +306,7 @@ def train_grpo(
                 kl_per_token = (r - 1.0) - log_r
 
                 # Get per token objective (not loss, want to maximise)
-                per_token_obj = policy_model_logprobs * batch_advantages.unsqueeze(-1) - kl_beta * kl_per_token
+                per_token_obj = policy_model_logprobs * batch_advantages.unsqueeze(-1) - KL_BETA * kl_per_token
 
                 # GRPO paper normalisation: normalise each completion by its own length, mean over P*G completions.
                 # Dividing each mini-batch contribution by total_completions and accumulating gives
@@ -315,14 +323,14 @@ def train_grpo(
 
             # Calculate metrics
             # TODO: no need to repeat rewards on each iteration
-            global_step = step * num_iterations_per_step + iteration_in_step
+            global_step = step * NUM_ITERATIONS_PER_STEP + iteration_in_step
             avg_loss = acc_loss / num_batches
             avg_reward = rewards.mean().item()
             reward_std = rewards.std().item()
             null_or_format_rewards = 100 * (rewards <= 0).sum().item() / total_size
 
             print(
-                f"Step {global_step}, iteration {iteration_in_step}/{num_iterations_per_step}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_proportion={null_or_format_rewards:.2f}, reward_std={reward_std:.2f}"
+                f"Step {global_step}, iteration {iteration_in_step}/{NUM_ITERATIONS_PER_STEP}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_proportion={null_or_format_rewards:.2f}, reward_std={reward_std:.2f}"
             )
 
             # TODO: log gradient norm, save checkpoints
