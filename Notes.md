@@ -15,3 +15,8 @@
     - Need to automatically accumulate gradient, to equal single optimization step!
     - Tricky to normalize correctly: original GRPO needs to normlize each completion by its sequence length, then by G. However, with a batch containing multiple prompts, we should normalize by PxG
 - Schulman unbiased estimator of KL
+- Gradient norm explodes without importance sampling with KL term
+  - The derivative of the KL is 1 - pi_ref/pi_theta
+  - If a token gets a strong negative, that ratio explodes
+  - Can clamp the log ratio further but the real fix is implementing importance sampling
+- Needing to mask out logprobs + importance sampling ratios!

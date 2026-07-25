@@ -1461,7 +1461,6 @@ dependencies = [
     { name = "gem-llm" },
     { name = "modal" },
     { name = "torch" },
-    { name = "tqdm" },
     { name = "transformers" },
     { name = "wandb" },
 ]
@@ -1483,7 +1482,6 @@ requires-dist = [
     { name = "gem-llm", specifier = "==0.1.0" },
     { name = "modal", specifier = ">=1.4.2" },
     { name = "torch", specifier = ">=2.7.0", index = "https://download.pytorch.org/whl/cu126" },
-    { name = "tqdm", specifier = ">=4,<5" },
     { name = "transformers", specifier = ">=5,<6" },
     { name = "wandb", specifier = ">=0.23.1" },
 ]
