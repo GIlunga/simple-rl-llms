@@ -10,7 +10,8 @@ from rich.text import Text
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+import wandb
 
 # Disable annoying prints
 warnings.filterwarnings("ignore", message=".*tl.make_block_ptr is deprecated.*")
@@ -24,6 +25,8 @@ class Parameters:
     gpu = "L4"  # Single GPU for now!
     dtype = torch.bfloat16
     timeout = 400  # seconds
+    wandb_project = "Simple RL for LLMs"
+    wandb_run_name = None
 
     # GRPO settings
     num_iterations = 1  # Outer loop, sync reference model
@@ -288,13 +291,7 @@ def get_logprobs_from_logits(model_output, targets):
     )
 
 
-@app.function(
-    gpu=params.gpu,
-    timeout=params.timeout,
-    secrets=[modal.Secret.from_name("huggingface-secret")],
-    volumes={"/root/.triton": kernel_volume},
-)
-def train_grpo():
+def train_grpo(wandb_run):
     policy_model = AutoModelForCausalLM.from_pretrained(params.model_name, device_map="cuda", dtype=params.dtype)
     reference_model = AutoModelForCausalLM.from_pretrained(
         params.model_name, device_map="cuda", dtype=params.dtype
@@ -328,16 +325,18 @@ def train_grpo():
             # TODO: move this to new function, get_dataset, which calls get_rollouts and this
             all_old_policy_logprobs = get_logprobs_from_rollouts(policy_model, token_seqs, loss_mask, attn_mask)
 
+            # Calculate reward metrics
+            total_size, _ = token_seqs.shape
             avg_reward = rewards.mean().item()
             reward_std = rewards.std().item()
-
-            policy_model.train()
-            total_size, _ = token_seqs.shape
-            num_batches = (total_size + params.per_device_batch_size - 1) // params.per_device_batch_size
+            zero_reward_percent = 100 * (rewards <= 0).sum().item() / total_size
 
             # Inner loop - train multiple times on the same batch, each iteration == 1 optimization step
+            policy_model.train()
+            num_batches = (total_size + params.per_device_batch_size - 1) // params.per_device_batch_size
             for grpo_iteration in range(1, params.num_grpo_iterations + 1):
                 acc_loss = 0.0
+                global_step = step * params.num_grpo_iterations
 
                 optimizer.zero_grad()
                 for batch_idx in range(num_batches):
@@ -403,13 +402,35 @@ def train_grpo():
                 ).item()
                 optimizer.step()
 
-                # Calculate metrics
-                global_step = step * params.num_grpo_iterations
+                # Calculate metrics, only add rewards once
                 avg_loss = acc_loss / num_batches
-                null_or_format_rewards = 100 * (rewards <= 0).sum().item() / total_size
+                metrics = {"step": global_step, "avg_loss": avg_loss, "unclipped_grad_norm": unclipped_grad_norm}
 
+                if grpo_iteration == 1:
+                    metrics.update(
+                        {"avg_reward": avg_reward, "std_reward": reward_std, "zero_reward_percent": zero_reward_percent}
+                    )
+
+                wandb.log(metrics)
+
+                # TODO: pretty print
                 print(
-                    f"Step {global_step}, iteration {grpo_iteration}/{params.num_grpo_iterations}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_proportion={null_or_format_rewards:.2f}, reward_std={reward_std:.2f}, unclipped grad_norm={unclipped_grad_norm:.4f}"
+                    f"Step {global_step}, iteration {grpo_iteration}/{params.num_grpo_iterations}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_proportion={zero_reward_percent:.2f}, reward_std={reward_std:.2f}, unclipped grad_norm={unclipped_grad_norm:.4f}"
                 )
 
                 # TODO: Save checkpoints
+
+
+@app.function(
+    gpu=params.gpu,
+    timeout=params.timeout,
+    secrets=[modal.Secret.from_name("huggingface-secret"), modal.Secret.from_name("wandb-secret")],
+    volumes={"/root/.triton": kernel_volume},
+)
+def train_grpo_with_wandb():
+    wandb_run = wandb.init(project=params.wandb_project, name=params.wandb_run_name, config=asdict(params))
+
+    try:
+        train_grpo(wandb_run)
+    finally:
+        wandb.finish()
