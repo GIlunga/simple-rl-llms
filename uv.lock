@@ -1483,6 +1483,7 @@ requires-dist = [
     { name = "modal", specifier = ">=1.4.2" },
     { name = "torch", specifier = ">=2.7.0", index = "https://download.pytorch.org/whl/cu126" },
     { name = "transformers", specifier = ">=5,<6" },
+    { name = "wandb", specifier = "==0.28.1" },
     { name = "wandb", specifier = ">=0.23.1" },
 ]
 

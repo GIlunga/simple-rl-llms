@@ -1,12 +1,10 @@
 # Next Steps
-- [x] Add gradient clipping (e.g., `max_grad_norm=1.0`) to prevent exploding gradients from large advantage values
-- [x] Add importance sampling
+- [ ] Add back wandb
 
 - [ ] Log KL
-- [ ] Add back wandb
-- [ ] Add warmup
-- [ ] Fix max tokens per turn (rename variable)
 - [ ] Add pass@K
+
+- [ ] Add warmup
 - [ ] Allow thinking
 - [ ] Force boxed start with no think
 - [ ] Add baselines - untrained model, binary search

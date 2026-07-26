@@ -14,6 +14,7 @@ dependencies = [
     "modal>=1.4.2",
     "causal-conv1d",
     "flash-linear-attention[cuda]>=0.5,<0.6",
+    "wandb==0.28.1"
 ]
 
 [dependency-groups]
@@ -38,5 +39,5 @@ explicit = true
 torch = { index = "pytorch" }
 
 [tool.ruff]
-line-length = 100
+line-length = 120
 target-version = "py312"

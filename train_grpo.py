@@ -10,27 +10,43 @@ from rich.text import Text
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
 import warnings
+from dataclasses import dataclass
 
 # Disable annoying prints
 warnings.filterwarnings("ignore", message=".*tl.make_block_ptr is deprecated.*")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Parameters
-MODEL_NAME = "Qwen/Qwen3.5-0.8B"
-GPU = "L4"
-DTYPE = torch.bfloat16
-TIMEOUT = 400  # seconds
-NUM_STEPS = 2
-NUM_PROMPTS_PER_STEP = 1
-NUM_COMPLETIONS_PER_PROMPT = 2
-NUM_ITERATIONS_PER_STEP = 1
-REF_MODEL_SYNC_EVERY_N_STEPS = 2
-KL_BETA = 0.05
-IMPORTANCE_SAMPLING_EPS = 0.2
-LEARNING_RATE = 1e-5
-MAX_GRAD_NORM = 2
-PER_DEVICE_BATCH_SIZE = 2
-MAX_TOKENS_PER_TURN = 128
+
+@dataclass
+class Parameters:
+    # Modal settings
+    model_name = "Qwen/Qwen3.5-0.8B"
+    gpu = "L4"  # Single GPU for now!
+    dtype = torch.bfloat16
+    timeout = 400  # seconds
+
+    # GRPO settings
+    num_iterations = 1  # Outer loop, sync reference model
+    num_steps = 2  # Mid loop, sample prompts + outputs to train grpo_iterations times
+    num_grpo_iterations = 1  # Inner loop, GRPO update on batch from step
+
+    num_prompts_per_step = 2
+    num_outputs_per_prompt = 2
+    per_device_batch_size = 2
+
+    kl_beta = 0.05
+    importance_sampling_eps = 0.2
+    learning_rate = 1e-5
+    max_grad_norm = 2
+
+    # Env settings
+    min_number = 1
+    max_number = 10
+    max_turns = 5
+    max_tokens_per_turn = 32
+
+
+params = Parameters()
 
 
 # Modal image definition
@@ -38,7 +54,7 @@ def download_models():
     # Helper for Modal image caching
     from huggingface_hub import snapshot_download
 
-    snapshot_download(MODEL_NAME)
+    snapshot_download(params.model_name)
 
 
 kernel_volume = modal.Volume.from_name("kernel-cache", create_if_missing=True)
@@ -105,7 +121,7 @@ def print_rollouts(
 
 
 # Actual GRPO algo
-def generate_single_rollout(env, model, tokenizer, max_rollout_tokens):
+def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
     message_list = [
         {
             "content": "You are playing Guess The Number with the user. You have to guess the number between 1 and 10 (inclusive) within 5 turns. As you enter your guess, the user will provide you with hints such as the target number is 'higher' or 'lower'. When answering, only the number that is wrapped inside \\boxed{} will be considered as your guess, for example, \\boxed{10}. Follow that exact format for your final answer.",
@@ -127,14 +143,14 @@ def generate_single_rollout(env, model, tokenizer, max_rollout_tokens):
     inputs = tokenizer(inputs_text, return_tensors="pt").to(model.device)
     prev_len = inputs["input_ids"].shape[1]
     output_mask = [False] * prev_len  # Mask out system prompt + special tokens
-    ENDOFTEXT_TOKEN_ID = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+    end_of_text_token_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
     im_end_token = tokenizer.convert_tokens_to_ids("<|im_end|>")
     # Iterate multi-step env
     while True:
         with torch.inference_mode():
             output_dict = model.generate(
                 **inputs,
-                max_new_tokens=max_rollout_tokens,
+                max_new_tokens=max_tokens_per_turn,
                 temperature=1.0,
                 do_sample=True,
                 use_cache=True,
@@ -144,13 +160,11 @@ def generate_single_rollout(env, model, tokenizer, max_rollout_tokens):
             )
 
         # Strip end of text
-        if output_dict.sequences[0][-1] == ENDOFTEXT_TOKEN_ID:
+        if output_dict.sequences[0][-1] == end_of_text_token_id:
             output_dict.sequences = output_dict.sequences[:, :-1]
 
         # Env step
-        text_response = tokenizer.decode(
-            output_dict.sequences[0][prev_len:], skip_special_tokens=True
-        )
+        text_response = tokenizer.decode(output_dict.sequences[0][prev_len:], skip_special_tokens=True)
         observation, reward, terminated, truncated, _ = env.step(text_response)
 
         # Update mask with model response
@@ -163,9 +177,7 @@ def generate_single_rollout(env, model, tokenizer, max_rollout_tokens):
         if terminated or truncated:
             break
 
-        new_inputs = tokenizer.apply_chat_template(
-            [observation_msg], tokenize=False, add_generation_prompt=True
-        )
+        new_inputs = tokenizer.apply_chat_template([observation_msg], tokenize=False, add_generation_prompt=True)
 
         new_inputs = tokenizer(new_inputs, return_tensors="pt").to(model.device)
 
@@ -182,12 +194,12 @@ def generate_single_rollout(env, model, tokenizer, max_rollout_tokens):
 
 def get_logprobs_from_rollouts(policy_model, token_seqs, loss_mask, attn_mask):
     total_size, _ = token_seqs.shape
-    num_batches = (total_size + PER_DEVICE_BATCH_SIZE - 1) // PER_DEVICE_BATCH_SIZE
+    num_batches = (total_size + params.per_device_batch_size - 1) // params.per_device_batch_size
     old_policy_logprobs_list = []
     with torch.inference_mode():
         for batch_idx in range(num_batches):
-            start_idx = batch_idx * PER_DEVICE_BATCH_SIZE
-            end_idx = (batch_idx + 1) * PER_DEVICE_BATCH_SIZE
+            start_idx = batch_idx * params.per_device_batch_size
+            end_idx = (batch_idx + 1) * params.per_device_batch_size
 
             batch_inputs = token_seqs[start_idx:end_idx].cuda()
             batch_attn_mask = attn_mask[start_idx:end_idx].cuda()
@@ -206,7 +218,7 @@ def get_rollouts(
     base_env,
     policy_model,
     tokenizer,
-    max_rollout_tokens,
+    max_tokens_per_turn,
     num_prompts_per_step,
     num_completions_per_prompt,
 ):
@@ -226,7 +238,7 @@ def get_rollouts(
         group_rewards = []
         for env in env_copies:
             token_seq, output_mask, reward, won, turn_count = generate_single_rollout(
-                env, policy_model, tokenizer, max_rollout_tokens
+                env, policy_model, tokenizer, max_tokens_per_turn
             )
 
             token_seq_lst.append(token_seq.squeeze())
@@ -242,14 +254,10 @@ def get_rollouts(
         advantage_lst.append(advantages)
 
     # shape: B x T
-    token_seqs = torch.nn.utils.rnn.pad_sequence(
-        token_seq_lst, batch_first=True, padding_value=tokenizer.pad_token_id
-    )
+    token_seqs = torch.nn.utils.rnn.pad_sequence(token_seq_lst, batch_first=True, padding_value=tokenizer.pad_token_id)
     attn_mask = token_seqs != tokenizer.pad_token_id
 
-    loss_mask = torch.nn.utils.rnn.pad_sequence(
-        output_mask_lst, batch_first=True, padding_value=False
-    )
+    loss_mask = torch.nn.utils.rnn.pad_sequence(output_mask_lst, batch_first=True, padding_value=False)
     loss_mask &= attn_mask
 
     all_rewards = torch.cat(reward_lst)
@@ -281,135 +289,127 @@ def get_logprobs_from_logits(model_output, targets):
 
 
 @app.function(
-    gpu=GPU,
-    timeout=TIMEOUT,
+    gpu=params.gpu,
+    timeout=params.timeout,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={"/root/.triton": kernel_volume},
 )
 def train_grpo():
-    policy_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="cuda", dtype=DTYPE)
+    policy_model = AutoModelForCausalLM.from_pretrained(params.model_name, device_map="cuda", dtype=params.dtype)
     reference_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, device_map="cuda", dtype=DTYPE
+        params.model_name, device_map="cuda", dtype=params.dtype
     ).eval()
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(params.model_name)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.convert_tokens_to_ids("<|endoftext|>")
 
-    base_env = GuessTheNumberEnv(min_number=1, max_number=10, max_turns=5)
+    base_env = GuessTheNumberEnv(min_number=params.min_number, max_number=params.max_number, max_turns=params.max_turns)
 
-    optimizer = torch.optim.AdamW(policy_model.parameters(), LEARNING_RATE)
+    optimizer = torch.optim.AdamW(policy_model.parameters(), params.learning_rate)
 
-    for step in range(NUM_STEPS):
-        if REF_MODEL_SYNC_EVERY_N_STEPS > 1 and ((step + 1) % REF_MODEL_SYNC_EVERY_N_STEPS) == 0:
+    for iteration in range(1, params.num_iterations + 1):
+        if iteration > 1:
             print("Syncing reference model")
             reference_model.load_state_dict(policy_model.state_dict())
 
-        # Generate dataset for this step (num_prompts * num_completions_per_prompt)
-        token_seqs, loss_mask, attn_mask, rewards, advantages = get_rollouts(
-            base_env,
-            policy_model,
-            tokenizer,
-            MAX_TOKENS_PER_TURN,
-            NUM_PROMPTS_PER_STEP,
-            NUM_COMPLETIONS_PER_PROMPT,
-        )
-
-        all_old_policy_logprobs = get_logprobs_from_rollouts(
-            policy_model, token_seqs, loss_mask, attn_mask
-        )
-
-        policy_model.train()
-
-        # Slice according to batch size per device (single device for now!)
-        total_size, _ = token_seqs.shape
-        num_batches = (total_size + PER_DEVICE_BATCH_SIZE - 1) // PER_DEVICE_BATCH_SIZE
-
-        # Train multiple times on the same batch
-        for iteration_in_step in range(NUM_ITERATIONS_PER_STEP):
-            acc_loss = 0.0
-
-            optimizer.zero_grad()
-            for batch_idx in range(num_batches):
-                # Get batch data
-                start_idx = batch_idx * PER_DEVICE_BATCH_SIZE
-                end_idx = (batch_idx + 1) * PER_DEVICE_BATCH_SIZE
-
-                batch_inputs = token_seqs[start_idx:end_idx].cuda()
-                batch_attn_mask = attn_mask[start_idx:end_idx].cuda()
-                batch_loss_mask = loss_mask[start_idx:end_idx].cuda()
-                batch_advantages = advantages[start_idx:end_idx].cuda()
-                batch_old_logprobs = all_old_policy_logprobs[start_idx:end_idx].cuda()
-                targets = batch_inputs[:, 1:]
-
-                # Shift mask by 1 to match logprobs
-                shifted_loss_mask = batch_loss_mask[:, 1:]
-                policy_model_output = policy_model.forward(
-                    batch_inputs, attention_mask=batch_attn_mask
-                )
-                policy_model_logprobs = (
-                    get_logprobs_from_logits(policy_model_output, targets) * shifted_loss_mask
-                )
-
-                # TODO: move this up, no need to recalculate each time!
-                with torch.inference_mode():
-                    ref_model_output = reference_model.forward(
-                        batch_inputs, attention_mask=batch_attn_mask
-                    )
-                ref_model_logprobs = (
-                    get_logprobs_from_logits(ref_model_output, targets) * shifted_loss_mask
-                )
-
-                # Compute KL (K3 from http://joschu.net/blog/kl-approx.html)
-                # 1. Compute log(r) = log(pi_ref) - log(pi_theta)
-                log_r = torch.clamp(ref_model_logprobs - policy_model_logprobs, max=2.0)
-
-                # 2. Compute r = pi_ref / pi_theta
-                r = torch.exp(log_r)
-
-                # 3. Apply the token-level k3 formula: (r - 1) - log(r)
-                kl_per_token = (r - 1.0) - log_r
-
-                # Get per token objective, first calculate importance sampling
-                ratio = torch.exp(policy_model_logprobs - batch_old_logprobs)
-                unclipped_obj = ratio * batch_advantages.unsqueeze(-1)
-                clipped_obj = torch.clamp(
-                    ratio * batch_advantages.unsqueeze(-1),
-                    1.0 - IMPORTANCE_SAMPLING_EPS,
-                    1.0 + IMPORTANCE_SAMPLING_EPS,
-                )
-                policy_obj = torch.min(unclipped_obj, clipped_obj)
-
-                # Note: need to reapply mask because exp(0) * advantages makes it non-zero!
-                per_token_obj = (policy_obj - KL_BETA * kl_per_token) * shifted_loss_mask
-
-                # GRPO paper normalisation: normalise each completion by its own length, mean over P*G completions.
-                # Dividing each mini-batch contribution by total_completions and accumulating gives
-                # the same gradient as processing the full batch in one forward pass.
-                seq_lengths = shifted_loss_mask.sum(dim=1)
-                seq_objs = per_token_obj.sum(dim=1) / seq_lengths
-                loss = -seq_objs.sum() / total_size
-                loss.backward()
-
-                # TODO: accumulate loss components (kl term separate)
-                acc_loss += loss.item()
-
-            # Clip gradient norm, save unclipped for logging
-            unclipped_grad_norm = torch.nn.utils.clip_grad_norm_(
-                policy_model.parameters(), MAX_GRAD_NORM
-            ).item()
-            optimizer.step()
-
-            # Calculate metrics
-            # TODO: no need to repeat rewards on each iteration
-            global_step = step * NUM_ITERATIONS_PER_STEP + iteration_in_step
-            avg_loss = acc_loss / num_batches
-            avg_reward = rewards.mean().item()
-            reward_std = rewards.std().item()
-            null_or_format_rewards = 100 * (rewards <= 0).sum().item() / total_size
-
-            print(
-                f"Step {global_step}, iteration {iteration_in_step}/{NUM_ITERATIONS_PER_STEP}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_proportion={null_or_format_rewards:.2f}, reward_std={reward_std:.2f}, unclipped grad_norm={unclipped_grad_norm:.4f}"
+        for step in range(1, params.num_steps + 1):
+            # Generate dataset for this step (num_prompts * num_outputs_per_prompt)
+            # Technically a batch in the GRPO paper
+            token_seqs, loss_mask, attn_mask, rewards, advantages = get_rollouts(
+                base_env,
+                policy_model,
+                tokenizer,
+                params.max_tokens_per_turn,
+                params.num_prompts_per_step,
+                params.num_outputs_per_prompt,
             )
 
-            # TODO: Save checkpoints
+            # TODO: move this to new function, get_dataset, which calls get_rollouts and this
+            all_old_policy_logprobs = get_logprobs_from_rollouts(policy_model, token_seqs, loss_mask, attn_mask)
+
+            avg_reward = rewards.mean().item()
+            reward_std = rewards.std().item()
+
+            policy_model.train()
+            total_size, _ = token_seqs.shape
+            num_batches = (total_size + params.per_device_batch_size - 1) // params.per_device_batch_size
+
+            # Inner loop - train multiple times on the same batch, each iteration == 1 optimization step
+            for grpo_iteration in range(1, params.num_grpo_iterations + 1):
+                acc_loss = 0.0
+
+                optimizer.zero_grad()
+                for batch_idx in range(num_batches):
+                    # Get batch from dataset
+                    start_idx = batch_idx * params.per_device_batch_size
+                    end_idx = (batch_idx + 1) * params.per_device_batch_size
+
+                    batch_inputs = token_seqs[start_idx:end_idx].cuda()
+                    batch_attn_mask = attn_mask[start_idx:end_idx].cuda()
+                    batch_loss_mask = loss_mask[start_idx:end_idx].cuda()
+                    batch_advantages = advantages[start_idx:end_idx].cuda()
+                    batch_old_logprobs = all_old_policy_logprobs[start_idx:end_idx].cuda()
+                    targets = batch_inputs[:, 1:]
+
+                    # Get policy model logprobs
+                    shifted_loss_mask = batch_loss_mask[:, 1:]  # Shift mask by 1 to match logprobs
+                    policy_model_output = policy_model.forward(batch_inputs, attention_mask=batch_attn_mask)
+                    policy_model_logprobs = get_logprobs_from_logits(policy_model_output, targets) * shifted_loss_mask
+
+                    # TODO: move this up, no need to recalculate each time!
+                    # Get reference model logprobs
+                    with torch.inference_mode():
+                        ref_model_output = reference_model.forward(batch_inputs, attention_mask=batch_attn_mask)
+                    ref_model_logprobs = get_logprobs_from_logits(ref_model_output, targets) * shifted_loss_mask
+
+                    # Compute KL (K3 from http://joschu.net/blog/kl-approx.html)
+                    # 1. Compute log(r) = log(pi_ref) - log(pi_theta)
+                    log_r = torch.clamp(ref_model_logprobs - policy_model_logprobs, max=2.0)
+
+                    # 2. Compute r = pi_ref / pi_theta
+                    r = torch.exp(log_r)
+
+                    # 3. Apply the token-level k3 formula: (r - 1) - log(r)
+                    kl_per_token = (r - 1.0) - log_r
+
+                    # Calculate per token objective
+                    ratio = torch.exp(policy_model_logprobs - batch_old_logprobs)
+                    unclipped_obj = ratio * batch_advantages.unsqueeze(-1)
+                    clipped_obj = torch.clamp(
+                        ratio * batch_advantages.unsqueeze(-1),
+                        1.0 - params.importance_sampling_eps,
+                        1.0 + params.importance_sampling_eps,
+                    )
+                    policy_obj = torch.min(unclipped_obj, clipped_obj)
+
+                    # Note: need to reapply mask because ratio (exp(0)) * advantages makes it non-zero!
+                    per_token_obj = (policy_obj - params.kl_beta * kl_per_token) * shifted_loss_mask
+
+                    # GRPO paper normalisation: normalise each completion by its own length, mean over P*G completions.
+                    # Dividing each mini-batch contribution by total_completions and accumulating gives
+                    # the same gradient as processing the full batch in one forward pass.
+                    seq_lengths = shifted_loss_mask.sum(dim=1)
+                    seq_objs = per_token_obj.sum(dim=1) / seq_lengths
+                    loss = -seq_objs.sum() / total_size
+                    loss.backward()
+
+                    # TODO: accumulate loss components (kl term separate)
+                    acc_loss += loss.item()
+
+                # Clip gradient norm, save unclipped for logging
+                unclipped_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy_model.parameters(), params.max_grad_norm
+                ).item()
+                optimizer.step()
+
+                # Calculate metrics
+                global_step = step * params.num_grpo_iterations
+                avg_loss = acc_loss / num_batches
+                null_or_format_rewards = 100 * (rewards <= 0).sum().item() / total_size
+
+                print(
+                    f"Step {global_step}, iteration {grpo_iteration}/{params.num_grpo_iterations}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_proportion={null_or_format_rewards:.2f}, reward_std={reward_std:.2f}, unclipped grad_norm={unclipped_grad_norm:.4f}"
+                )
+
+                # TODO: Save checkpoints
