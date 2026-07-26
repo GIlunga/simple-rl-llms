@@ -1,9 +1,4 @@
 # Next Steps
-- [ ] Add back wandb
-
-- [ ] Log KL
-- [ ] Add pass@K
-
 - [ ] Add warmup
 - [ ] Allow thinking
 - [ ] Force boxed start with no think

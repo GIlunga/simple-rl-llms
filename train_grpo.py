@@ -71,6 +71,8 @@ app = modal.App("llm-rl-test", image=image)
 
 
 # Visualisation
+console = Console()
+
 def print_masked_sequence(
     sequences: torch.Tensor,
     mask: torch.Tensor,
@@ -105,7 +107,6 @@ def print_rollouts(
     tokenizer,
     num_completions_per_prompt: int,
 ) -> None:
-    console = Console()
     num_prompts = len(won_lst) // num_completions_per_prompt
     for prompt_idx in range(num_prompts):
         console.rule(f"[bold]Prompt {prompt_idx + 1}[/]")
@@ -167,7 +168,9 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
             output_dict.sequences = output_dict.sequences[:, :-1]
 
         # Env step
-        text_response = tokenizer.decode(output_dict.sequences[0][prev_len:], skip_special_tokens=True)
+        text_response = tokenizer.decode(
+            output_dict.sequences[0][prev_len:], skip_special_tokens=True
+        )
         observation, reward, terminated, truncated, _ = env.step(text_response)
 
         # Update mask with model response
@@ -180,7 +183,9 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
         if terminated or truncated:
             break
 
-        new_inputs = tokenizer.apply_chat_template([observation_msg], tokenize=False, add_generation_prompt=True)
+        new_inputs = tokenizer.apply_chat_template(
+            [observation_msg], tokenize=False, add_generation_prompt=True
+        )
 
         new_inputs = tokenizer(new_inputs, return_tensors="pt").to(model.device)
 
@@ -257,10 +262,14 @@ def get_rollouts(
         advantage_lst.append(advantages)
 
     # shape: B x T
-    token_seqs = torch.nn.utils.rnn.pad_sequence(token_seq_lst, batch_first=True, padding_value=tokenizer.pad_token_id)
+    token_seqs = torch.nn.utils.rnn.pad_sequence(
+        token_seq_lst, batch_first=True, padding_value=tokenizer.pad_token_id
+    )
     attn_mask = token_seqs != tokenizer.pad_token_id
 
-    loss_mask = torch.nn.utils.rnn.pad_sequence(output_mask_lst, batch_first=True, padding_value=False)
+    loss_mask = torch.nn.utils.rnn.pad_sequence(
+        output_mask_lst, batch_first=True, padding_value=False
+    )
     loss_mask &= attn_mask
 
     all_rewards = torch.cat(reward_lst)
@@ -292,7 +301,9 @@ def get_logprobs_from_logits(model_output, targets):
 
 
 def train_grpo(wandb_run):
-    policy_model = AutoModelForCausalLM.from_pretrained(params.model_name, device_map="cuda", dtype=params.dtype)
+    policy_model = AutoModelForCausalLM.from_pretrained(
+        params.model_name, device_map="cuda", dtype=params.dtype
+    )
     reference_model = AutoModelForCausalLM.from_pretrained(
         params.model_name, device_map="cuda", dtype=params.dtype
     ).eval()
@@ -301,7 +312,9 @@ def train_grpo(wandb_run):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.convert_tokens_to_ids("<|endoftext|>")
 
-    base_env = GuessTheNumberEnv(min_number=params.min_number, max_number=params.max_number, max_turns=params.max_turns)
+    base_env = GuessTheNumberEnv(
+        min_number=params.min_number, max_number=params.max_number, max_turns=params.max_turns
+    )
 
     optimizer = torch.optim.AdamW(policy_model.parameters(), params.learning_rate)
 
@@ -323,19 +336,27 @@ def train_grpo(wandb_run):
             )
 
             # TODO: move this to new function, get_dataset, which calls get_rollouts and this
-            all_old_policy_logprobs = get_logprobs_from_rollouts(policy_model, token_seqs, loss_mask, attn_mask)
+            all_old_policy_logprobs = get_logprobs_from_rollouts(
+                policy_model, token_seqs, loss_mask, attn_mask
+            )
 
-            # Calculate reward metrics
+            # Calculate rollout metrics
             total_size, _ = token_seqs.shape
+            total_valid_tokens = loss_mask[:, 1:].sum().item()
+            avg_rollout_len = loss_mask[:, 1:].sum(dim=1).mean()
             avg_reward = rewards.mean().item()
             reward_std = rewards.std().item()
-            zero_reward_percent = 100 * (rewards <= 0).sum().item() / total_size
+            zero_reward_rate = (rewards <= 0).sum().item() / total_size
+            full_reward_rate = (rewards == 0).sum().item() / total_size
 
             # Inner loop - train multiple times on the same batch, each iteration == 1 optimization step
             policy_model.train()
-            num_batches = (total_size + params.per_device_batch_size - 1) // params.per_device_batch_size
+            num_batches = (
+                total_size + params.per_device_batch_size - 1
+            ) // params.per_device_batch_size
             for grpo_iteration in range(1, params.num_grpo_iterations + 1):
                 acc_loss = 0.0
+                acc_kl = 0.0
                 global_step = step * params.num_grpo_iterations
 
                 optimizer.zero_grad()
@@ -353,14 +374,22 @@ def train_grpo(wandb_run):
 
                     # Get policy model logprobs
                     shifted_loss_mask = batch_loss_mask[:, 1:]  # Shift mask by 1 to match logprobs
-                    policy_model_output = policy_model.forward(batch_inputs, attention_mask=batch_attn_mask)
-                    policy_model_logprobs = get_logprobs_from_logits(policy_model_output, targets) * shifted_loss_mask
+                    policy_model_output = policy_model.forward(
+                        batch_inputs, attention_mask=batch_attn_mask
+                    )
+                    policy_model_logprobs = (
+                        get_logprobs_from_logits(policy_model_output, targets) * shifted_loss_mask
+                    )
 
                     # TODO: move this up, no need to recalculate each time!
                     # Get reference model logprobs
                     with torch.inference_mode():
-                        ref_model_output = reference_model.forward(batch_inputs, attention_mask=batch_attn_mask)
-                    ref_model_logprobs = get_logprobs_from_logits(ref_model_output, targets) * shifted_loss_mask
+                        ref_model_output = reference_model.forward(
+                            batch_inputs, attention_mask=batch_attn_mask
+                        )
+                    ref_model_logprobs = (
+                        get_logprobs_from_logits(ref_model_output, targets) * shifted_loss_mask
+                    )
 
                     # Compute KL (K3 from http://joschu.net/blog/kl-approx.html)
                     # 1. Compute log(r) = log(pi_ref) - log(pi_theta)
@@ -393,8 +422,9 @@ def train_grpo(wandb_run):
                     loss = -seq_objs.sum() / total_size
                     loss.backward()
 
-                    # TODO: accumulate loss components (kl term separate)
+                    # Accumulate metrics
                     acc_loss += loss.item()
+                    acc_kl += kl_per_token.sum().item()
 
                 # Clip gradient norm, save unclipped for logging
                 unclipped_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -404,18 +434,31 @@ def train_grpo(wandb_run):
 
                 # Calculate metrics, only add rewards once
                 avg_loss = acc_loss / num_batches
-                metrics = {"step": global_step, "avg_loss": avg_loss, "unclipped_grad_norm": unclipped_grad_norm}
+                avg_kl = acc_kl / total_valid_tokens
+                metrics = {
+                    "step": global_step,
+                    "avg_loss": avg_loss,
+                    "unclipped_grad_norm": unclipped_grad_norm,
+                    "avg_kl": avg_kl,
+                }
 
                 if grpo_iteration == 1:
                     metrics.update(
-                        {"avg_reward": avg_reward, "std_reward": reward_std, "zero_reward_percent": zero_reward_percent}
+                        {
+                            "avg_reward": avg_reward,
+                            "std_reward": reward_std,
+                            "zero_reward_rate": zero_reward_rate,
+                            "full_reward_rate": full_reward_rate,
+                            "avg_rollout_len": avg_rollout_len,
+                        }
                     )
 
                 wandb.log(metrics)
 
                 # TODO: pretty print
                 print(
-                    f"Step {global_step}, iteration {grpo_iteration}/{params.num_grpo_iterations}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_proportion={zero_reward_percent:.2f}, reward_std={reward_std:.2f}, unclipped grad_norm={unclipped_grad_norm:.4f}"
+                    f"Step {global_step}, iteration {grpo_iteration}/{params.num_grpo_iterations}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_rate={zero_reward_rate:.2f},"
+                    f"full_reward_rate={full_reward_rate:.2f}, reward_std={reward_std:.2f}, unclipped grad_norm={unclipped_grad_norm:.4f}"
                 )
 
                 # TODO: Save checkpoints
@@ -428,7 +471,9 @@ def train_grpo(wandb_run):
     volumes={"/root/.triton": kernel_volume},
 )
 def train_grpo_with_wandb():
-    wandb_run = wandb.init(project=params.wandb_project, name=params.wandb_run_name, config=asdict(params))
+    wandb_run = wandb.init(
+        project=params.wandb_project, name=params.wandb_run_name, config=asdict(params)
+    )
 
     try:
         train_grpo(wandb_run)
