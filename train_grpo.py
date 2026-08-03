@@ -7,6 +7,7 @@ from gem.envs.game_env.guess_the_number import GuessTheNumberEnv
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
+from rich.tree import Tree
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import logging
 import warnings
@@ -22,7 +23,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 class Parameters:
     # Modal settings
     model_name = "Qwen/Qwen3.5-0.8B"
-    gpu = "L4"  # Single GPU for now!
+    gpu = "L4"
     dtype = torch.bfloat16
     timeout = 400  # seconds
     wandb_project = "Simple RL for LLMs"
@@ -31,11 +32,11 @@ class Parameters:
     # GRPO settings
     num_iterations = 1  # Outer loop, sync reference model
     num_steps = 2  # Mid loop, sample prompts + outputs to train grpo_iterations times
-    num_grpo_iterations = 1  # Inner loop, GRPO update on batch from step
+    num_grpo_iterations = 1  # Inner loop, GRPO update on step dataset
 
     num_prompts_per_step = 2
     num_outputs_per_prompt = 2
-    per_device_batch_size = 2
+    per_device_batch_size = 4
 
     kl_beta = 0.05
     importance_sampling_eps = 0.2
@@ -71,7 +72,8 @@ app = modal.App("llm-rl-test", image=image)
 
 
 # Visualisation
-console = Console()
+console = Console(force_terminal=True)
+
 
 def print_masked_sequence(
     sequences: torch.Tensor,
@@ -82,6 +84,7 @@ def print_masked_sequence(
     turn_count: int,
     reward: float,
 ) -> None:
+    """Print LLM generated text in green, other text muted"""
     text = Text()
     for tok, m in zip(sequences.tolist(), mask.tolist(), strict=True):
         decoded = tokenizer.decode([tok]).replace("\n", "\\n")
@@ -94,7 +97,7 @@ def print_masked_sequence(
         f"[white]turns={turn_count}[/]  "
         f"[white]reward=[/][{reward_style}]{round(reward, 2)}[/]"
     )
-    Console(force_terminal=True).print(Panel(text, title=title, border_style="bright_black"))
+    console.print(Panel(text, title=title, border_style="bright_black"))
 
 
 def print_rollouts(
@@ -128,7 +131,10 @@ def print_rollouts(
 def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
     message_list = [
         {
-            "content": "You are playing Guess The Number with the user. You have to guess the number between 1 and 10 (inclusive) within 5 turns. As you enter your guess, the user will provide you with hints such as the target number is 'higher' or 'lower'. When answering, only the number that is wrapped inside \\boxed{} will be considered as your guess, for example, \\boxed{10}. Follow that exact format for your final answer.",
+            "content": "You are playing Guess The Number with the user. You have to guess the number between 1 and 10 "
+            "(inclusive) within 5 turns. As you enter your guess, the user will provide you with hints such as the target "
+            "number is 'higher' or 'lower'. When answering, only the number that is wrapped inside \\boxed{} will be considered "
+            "as your guess, for example, \\boxed{10}. Follow that exact format for your final answer.",
             "role": "system",
         },
         {"content": "Enter your first guess to start the game!", "role": "user"},
@@ -149,6 +155,7 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
     output_mask = [False] * prev_len  # Mask out system prompt + special tokens
     end_of_text_token_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
     im_end_token = tokenizer.convert_tokens_to_ids("<|im_end|>")
+
     # Iterate multi-step env
     while True:
         with torch.inference_mode():
@@ -168,9 +175,7 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
             output_dict.sequences = output_dict.sequences[:, :-1]
 
         # Env step
-        text_response = tokenizer.decode(
-            output_dict.sequences[0][prev_len:], skip_special_tokens=True
-        )
+        text_response = tokenizer.decode(output_dict.sequences[0][prev_len:], skip_special_tokens=True)
         observation, reward, terminated, truncated, _ = env.step(text_response)
 
         # Update mask with model response
@@ -183,9 +188,7 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
         if terminated or truncated:
             break
 
-        new_inputs = tokenizer.apply_chat_template(
-            [observation_msg], tokenize=False, add_generation_prompt=True
-        )
+        new_inputs = tokenizer.apply_chat_template([observation_msg], tokenize=False, add_generation_prompt=True)
 
         new_inputs = tokenizer(new_inputs, return_tensors="pt").to(model.device)
 
@@ -196,8 +199,103 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
         output_mask += [False] * (inputs["input_ids"].shape[1] - output_dict.sequences.shape[1])
         prev_len = inputs["input_ids"].shape[1]
 
-    mask = torch.tensor(output_mask)
-    return output_dict.sequences.detach().cpu(), mask, reward, reward == 1.0, env.turn_count
+    return (
+        output_dict.sequences.detach().cpu(),
+        torch.tensor(output_mask),
+        reward,
+        reward == 1.0,
+        env.turn_count,
+    )
+
+
+def get_rollouts(
+    base_env,
+    policy_model,
+    reference_model,
+    tokenizer,
+    max_tokens_per_turn,
+    num_prompts_per_step,
+    num_completions_per_prompt,
+):
+    """Simple sequential multiple rollout generation for multiple prompts. No batching"""
+    token_seq_lst = []
+    output_mask_lst = []
+    reward_lst = []
+    advantage_lst = []
+    won_lst = []
+    turn_count_lst = []
+
+    for _ in range(num_prompts_per_step):
+        base_env.reset()
+        # Required to maintain same target for guess the number (env copies share same target number)
+        env_copies = [deepcopy(base_env) for _ in range(num_completions_per_prompt)]
+        group_rewards = []
+        for env in env_copies:
+            token_seq, output_mask, reward, won, turn_count = generate_single_rollout(
+                env, policy_model, tokenizer, max_tokens_per_turn
+            )
+
+            token_seq_lst.append(token_seq.squeeze())
+            output_mask_lst.append(output_mask)
+            group_rewards.append(reward)
+            won_lst.append(won)
+            turn_count_lst.append(turn_count)
+
+        group_rewards = torch.tensor(group_rewards)
+
+        # GRPO advantage normalization
+        advantages = (group_rewards - group_rewards.mean()) / (group_rewards.std() + 1e-8)
+
+        reward_lst.append(group_rewards)
+        advantage_lst.append(advantages)
+
+    # shape: B x T
+    token_seqs = torch.nn.utils.rnn.pad_sequence(token_seq_lst, batch_first=True, padding_value=tokenizer.pad_token_id)
+    attn_mask = token_seqs != tokenizer.pad_token_id
+
+    loss_mask = torch.nn.utils.rnn.pad_sequence(output_mask_lst, batch_first=True, padding_value=False)
+    loss_mask = (loss_mask & attn_mask).float()
+
+    # Get logprobs for importance sampling + KL
+    gen_policy_logprobs = get_logprobs_from_rollouts(policy_model, token_seqs, loss_mask, attn_mask)
+    ref_model_logprobs = get_logprobs_from_rollouts(reference_model, token_seqs, loss_mask, attn_mask)
+
+    # Compute dataset metrics
+    total_size, _ = token_seqs.shape
+    all_rewards = torch.cat(reward_lst)
+    reward_matrix = all_rewards.view(-1, num_completions_per_prompt)
+    dataset_metrics = {
+        "total_valid_tokens": int(loss_mask[:, 1:].sum().item()),
+        "avg_rollout_len": loss_mask[:, 1:].sum(dim=1).mean().item(),
+        "avg_reward": all_rewards.mean().item(),
+        "reward_std": all_rewards.std().item(),
+        "zero_reward_rate": (all_rewards <= 0).sum().item() / total_size,
+        "full_reward_rate": (all_rewards == 1).sum().item() / total_size,
+        "zero_reward_group_rate": (reward_matrix <= 0).all(dim=1).float().mean().item(),
+        "full_reward_group_rate": (reward_matrix == 1).all(dim=1).float().mean().item(),
+    }
+
+    # Print rollouts to stdout
+    print_rollouts(
+        token_seqs,
+        loss_mask,
+        attn_mask,
+        all_rewards,
+        won_lst,
+        turn_count_lst,
+        tokenizer,
+        num_completions_per_prompt,
+    )
+
+    return (
+        token_seqs,
+        loss_mask,
+        attn_mask,
+        torch.cat(advantage_lst),
+        dataset_metrics,
+        gen_policy_logprobs,
+        ref_model_logprobs,
+    )
 
 
 def get_logprobs_from_rollouts(policy_model, token_seqs, loss_mask, attn_mask):
@@ -222,74 +320,8 @@ def get_logprobs_from_rollouts(policy_model, token_seqs, loss_mask, attn_mask):
     return torch.cat(old_policy_logprobs_list, dim=0)
 
 
-def get_rollouts(
-    base_env,
-    policy_model,
-    tokenizer,
-    max_tokens_per_turn,
-    num_prompts_per_step,
-    num_completions_per_prompt,
-):
-    """Simple sequential multiple rollout generation for multiple prompts. No batching"""
-    token_seq_lst = []
-    output_mask_lst = []
-    reward_lst = []
-    advantage_lst = []
-    won_lst = []
-    turn_count_lst = []
-
-    for _ in range(num_prompts_per_step):
-        base_env.reset()
-        # Required to maintain same target for guess the number. May not be needed in other envs
-        # env copies share same target number
-        env_copies = [deepcopy(base_env) for _ in range(num_completions_per_prompt)]
-        group_rewards = []
-        for env in env_copies:
-            token_seq, output_mask, reward, won, turn_count = generate_single_rollout(
-                env, policy_model, tokenizer, max_tokens_per_turn
-            )
-
-            token_seq_lst.append(token_seq.squeeze())
-            output_mask_lst.append(output_mask)
-            group_rewards.append(reward)
-            won_lst.append(won)
-            turn_count_lst.append(turn_count)
-
-        group_rewards = torch.tensor(group_rewards)
-        advantages = (group_rewards - group_rewards.mean()) / (group_rewards.std() + 1e-8)
-
-        reward_lst.append(group_rewards)
-        advantage_lst.append(advantages)
-
-    # shape: B x T
-    token_seqs = torch.nn.utils.rnn.pad_sequence(
-        token_seq_lst, batch_first=True, padding_value=tokenizer.pad_token_id
-    )
-    attn_mask = token_seqs != tokenizer.pad_token_id
-
-    loss_mask = torch.nn.utils.rnn.pad_sequence(
-        output_mask_lst, batch_first=True, padding_value=False
-    )
-    loss_mask &= attn_mask
-
-    all_rewards = torch.cat(reward_lst)
-    print_rollouts(
-        token_seqs,
-        loss_mask,
-        attn_mask,
-        all_rewards,
-        won_lst,
-        turn_count_lst,
-        tokenizer,
-        num_completions_per_prompt,
-    )
-
-    return token_seqs, loss_mask, attn_mask, all_rewards, torch.cat(advantage_lst)
-
-
 def get_logprobs_from_logits(model_output, targets):
     # Shape: batch x seq_len x vocab
-    # TODO: can we do this without copies
     shifted_logits = model_output.logits[:, :-1, :]
     flat_logits = shifted_logits.reshape(-1, shifted_logits.size(-1))
     flat_targets = targets.reshape(-1)
@@ -301,9 +333,7 @@ def get_logprobs_from_logits(model_output, targets):
 
 
 def train_grpo(wandb_run):
-    policy_model = AutoModelForCausalLM.from_pretrained(
-        params.model_name, device_map="cuda", dtype=params.dtype
-    )
+    policy_model = AutoModelForCausalLM.from_pretrained(params.model_name, device_map="cuda", dtype=params.dtype)
     reference_model = AutoModelForCausalLM.from_pretrained(
         params.model_name, device_map="cuda", dtype=params.dtype
     ).eval()
@@ -312,9 +342,7 @@ def train_grpo(wandb_run):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.convert_tokens_to_ids("<|endoftext|>")
 
-    base_env = GuessTheNumberEnv(
-        min_number=params.min_number, max_number=params.max_number, max_turns=params.max_turns
-    )
+    base_env = GuessTheNumberEnv(min_number=params.min_number, max_number=params.max_number, max_turns=params.max_turns)
 
     optimizer = torch.optim.AdamW(policy_model.parameters(), params.learning_rate)
 
@@ -326,34 +354,29 @@ def train_grpo(wandb_run):
         for step in range(1, params.num_steps + 1):
             # Generate dataset for this step (num_prompts * num_outputs_per_prompt)
             # Technically a batch in the GRPO paper
-            token_seqs, loss_mask, attn_mask, rewards, advantages = get_rollouts(
+            (
+                token_seqs,
+                loss_mask,
+                attn_mask,
+                advantages,
+                dataset_metrics,
+                old_policy_logprobs,
+                ref_model_logprobs,
+            ) = get_rollouts(
                 base_env,
                 policy_model,
+                reference_model,
                 tokenizer,
                 params.max_tokens_per_turn,
                 params.num_prompts_per_step,
                 params.num_outputs_per_prompt,
             )
 
-            # TODO: move this to new function, get_dataset, which calls get_rollouts and this
-            all_old_policy_logprobs = get_logprobs_from_rollouts(
-                policy_model, token_seqs, loss_mask, attn_mask
-            )
-
-            # Calculate rollout metrics
             total_size, _ = token_seqs.shape
-            total_valid_tokens = loss_mask[:, 1:].sum().item()
-            avg_rollout_len = loss_mask[:, 1:].sum(dim=1).mean()
-            avg_reward = rewards.mean().item()
-            reward_std = rewards.std().item()
-            zero_reward_rate = (rewards <= 0).sum().item() / total_size
-            full_reward_rate = (rewards == 0).sum().item() / total_size
 
             # Inner loop - train multiple times on the same batch, each iteration == 1 optimization step
             policy_model.train()
-            num_batches = (
-                total_size + params.per_device_batch_size - 1
-            ) // params.per_device_batch_size
+            num_batches = (total_size + params.per_device_batch_size - 1) // params.per_device_batch_size
             for grpo_iteration in range(1, params.num_grpo_iterations + 1):
                 acc_loss = 0.0
                 acc_kl = 0.0
@@ -369,31 +392,18 @@ def train_grpo(wandb_run):
                     batch_attn_mask = attn_mask[start_idx:end_idx].cuda()
                     batch_loss_mask = loss_mask[start_idx:end_idx].cuda()
                     batch_advantages = advantages[start_idx:end_idx].cuda()
-                    batch_old_logprobs = all_old_policy_logprobs[start_idx:end_idx].cuda()
+                    batch_old_logprobs = old_policy_logprobs[start_idx:end_idx].cuda()
+                    batch_ref_logprobs = ref_model_logprobs[start_idx:end_idx].cuda()
                     targets = batch_inputs[:, 1:]
 
-                    # Get policy model logprobs
+                    # Get current policy model logprobs
                     shifted_loss_mask = batch_loss_mask[:, 1:]  # Shift mask by 1 to match logprobs
-                    policy_model_output = policy_model.forward(
-                        batch_inputs, attention_mask=batch_attn_mask
-                    )
-                    policy_model_logprobs = (
-                        get_logprobs_from_logits(policy_model_output, targets) * shifted_loss_mask
-                    )
-
-                    # TODO: move this up, no need to recalculate each time!
-                    # Get reference model logprobs
-                    with torch.inference_mode():
-                        ref_model_output = reference_model.forward(
-                            batch_inputs, attention_mask=batch_attn_mask
-                        )
-                    ref_model_logprobs = (
-                        get_logprobs_from_logits(ref_model_output, targets) * shifted_loss_mask
-                    )
+                    policy_model_output = policy_model.forward(batch_inputs, attention_mask=batch_attn_mask)
+                    policy_model_logprobs = get_logprobs_from_logits(policy_model_output, targets) * shifted_loss_mask
 
                     # Compute KL (K3 from http://joschu.net/blog/kl-approx.html)
                     # 1. Compute log(r) = log(pi_ref) - log(pi_theta)
-                    log_r = torch.clamp(ref_model_logprobs - policy_model_logprobs, max=2.0)
+                    log_r = torch.clamp(batch_ref_logprobs - policy_model_logprobs, max=2.0)
 
                     # 2. Compute r = pi_ref / pi_theta
                     r = torch.exp(log_r)
@@ -432,34 +442,36 @@ def train_grpo(wandb_run):
                 ).item()
                 optimizer.step()
 
-                # Calculate metrics, only add rewards once
+                # Calculate metrics
                 avg_loss = acc_loss / num_batches
-                avg_kl = acc_kl / total_valid_tokens
+                avg_kl = acc_kl / dataset_metrics["total_valid_tokens"]
                 metrics = {
                     "step": global_step,
-                    "avg_loss": avg_loss,
+                    "Loss/avg_total": avg_loss,
+                    "Loss/avg_kl": avg_kl,
                     "unclipped_grad_norm": unclipped_grad_norm,
-                    "avg_kl": avg_kl,
                 }
 
+                # Log metrics to wandb + print
                 if grpo_iteration == 1:
-                    metrics.update(
-                        {
-                            "avg_reward": avg_reward,
-                            "std_reward": reward_std,
-                            "zero_reward_rate": zero_reward_rate,
-                            "full_reward_rate": full_reward_rate,
-                            "avg_rollout_len": avg_rollout_len,
-                        }
-                    )
+                    wandb.log(metrics | dataset_metrics)
+                else:
+                    wandb.log(metrics)
 
-                wandb.log(metrics)
+                metrics |= dataset_metrics
 
-                # TODO: pretty print
-                print(
-                    f"Step {global_step}, iteration {grpo_iteration}/{params.num_grpo_iterations}: avg_loss={avg_loss:.2f}, rewards={avg_reward:.2f}, zero_reward_rate={zero_reward_rate:.2f},"
-                    f"full_reward_rate={full_reward_rate:.2f}, reward_std={reward_std:.2f}, unclipped grad_norm={unclipped_grad_norm:.4f}"
+                tree = Tree(
+                    f"[bold yellow] Global step {global_step}, iteration {grpo_iteration}/{params.num_grpo_iterations} [/bold yellow]"
                 )
+
+                for k, v in metrics.items():
+                    if k == "step":
+                        continue
+
+                    formatted_val = f"{v:.4f}" if isinstance(v, float) else str(v)
+                    tree.add(f"[cyan]{k}[/cyan]: {formatted_val}")
+
+                console.print(tree)
 
                 # TODO: Save checkpoints
 
@@ -471,9 +483,7 @@ def train_grpo(wandb_run):
     volumes={"/root/.triton": kernel_volume},
 )
 def train_grpo_with_wandb():
-    wandb_run = wandb.init(
-        project=params.wandb_project, name=params.wandb_run_name, config=asdict(params)
-    )
+    wandb_run = wandb.init(project=params.wandb_project, name=params.wandb_run_name, config=asdict(params))
 
     try:
         train_grpo(wandb_run)
