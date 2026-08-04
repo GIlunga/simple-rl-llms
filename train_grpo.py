@@ -1,25 +1,27 @@
+import logging
+import math
+import warnings
 from copy import deepcopy
+from dataclasses import asdict, dataclass
 
 import modal
 import torch
 import torch.nn.functional as F
+import wandb
 from gem.envs.game_env.guess_the_number import GuessTheNumberEnv
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 from rich.tree import Tree
+from torch.optim.lr_scheduler import LambdaLR
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import logging
-import warnings
-from dataclasses import dataclass, asdict
-import wandb
 
 # Disable annoying prints
 warnings.filterwarnings("ignore", message=".*tl.make_block_ptr is deprecated.*")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-@dataclass
+@dataclass(frozen=True)
 class Parameters:
     # Modal settings
     model_name = "Qwen/Qwen3.5-0.8B"
@@ -30,9 +32,9 @@ class Parameters:
     wandb_run_name = None
 
     # GRPO settings
-    num_iterations = 1  # Outer loop, sync reference model
+    num_iterations = 2  # Outer loop, sync reference model
     num_steps = 2  # Mid loop, sample prompts + outputs to train grpo_iterations times
-    num_grpo_iterations = 1  # Inner loop, GRPO update on step dataset
+    num_grpo_iterations = 1  # Inner loop, GRPO update on step dataset (replay)
 
     num_prompts_per_step = 2
     num_outputs_per_prompt = 2
@@ -40,8 +42,12 @@ class Parameters:
 
     kl_beta = 0.05
     importance_sampling_eps = 0.2
-    learning_rate = 1e-5
     max_grad_norm = 2
+
+    max_learning_rate = 5e-6
+    min_learning_rate = 0
+    warmup_ratio = 0.05
+    decay_ratio = 0.1
 
     # Env settings
     min_number = 1
@@ -132,9 +138,10 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
     message_list = [
         {
             "content": "You are playing Guess The Number with the user. You have to guess the number between 1 and 10 "
-            "(inclusive) within 5 turns. As you enter your guess, the user will provide you with hints such as the target "
-            "number is 'higher' or 'lower'. When answering, only the number that is wrapped inside \\boxed{} will be considered "
-            "as your guess, for example, \\boxed{10}. Follow that exact format for your final answer.",
+            "(inclusive) within 5 turns. As you enter your guess, the user will provide you with hints such as the "
+            "target number is 'higher' or 'lower'. When answering, only the number that is wrapped inside \\boxed{} "
+            "will be considered as your guess, for example, \\boxed{10}. Follow that exact format for your final "
+            "answer.",
             "role": "system",
         },
         {"content": "Enter your first guess to start the game!", "role": "user"},
@@ -264,15 +271,19 @@ def get_rollouts(
     total_size, _ = token_seqs.shape
     all_rewards = torch.cat(reward_lst)
     reward_matrix = all_rewards.view(-1, num_completions_per_prompt)
+    rollout_lens = loss_mask[:, 1:].sum(dim=1)
     dataset_metrics = {
-        "total_valid_tokens": int(loss_mask[:, 1:].sum().item()),
-        "avg_rollout_len": loss_mask[:, 1:].sum(dim=1).mean().item(),
-        "avg_reward": all_rewards.mean().item(),
-        "reward_std": all_rewards.std().item(),
-        "zero_reward_rate": (all_rewards <= 0).sum().item() / total_size,
-        "full_reward_rate": (all_rewards == 1).sum().item() / total_size,
-        "zero_reward_group_rate": (reward_matrix <= 0).all(dim=1).float().mean().item(),
-        "full_reward_group_rate": (reward_matrix == 1).all(dim=1).float().mean().item(),
+        "Rollout Len/avg": rollout_lens.mean().item(),
+        "Rollout Len/max": rollout_lens.max().item(),
+        "Rollout Len/min": rollout_lens.min().item(),
+        "Rewards/avg": all_rewards.mean().item(),
+        "Rewards/std": all_rewards.std().item(),
+        "Rewards/max": all_rewards.max().item(),
+        "Rewards/min": all_rewards.min().item(),
+        "Rewards/zero_rate": (all_rewards <= 0).sum().item() / total_size,
+        "Rewards/one_rate": (all_rewards == 1).sum().item() / total_size,
+        "Rewards/zero_group_rate": (reward_matrix <= 0).all(dim=1).float().mean().item(),
+        "Rewards/one_group_rate": (reward_matrix == 1).all(dim=1).float().mean().item(),
     }
 
     # Print rollouts to stdout
@@ -332,6 +343,30 @@ def get_logprobs_from_logits(model_output, targets):
     )
 
 
+def create_wsd_scheduler(optimizer, total_steps):
+    num_warmup_steps = int(params.warmup_ratio * total_steps)
+    stable_ratio = 1 - params.warmup_ratio - params.decay_ratio
+    num_stable_steps = int(stable_ratio * total_steps)
+    num_decay_steps = total_steps - num_warmup_steps - num_stable_steps
+
+    min_lr_ratio = params.min_learning_rate / params.max_learning_rate
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < num_warmup_steps:
+            return current_step / num_warmup_steps
+
+        if current_step < (num_warmup_steps + num_stable_steps):
+            return 1.0
+
+        decay_progress = (current_step - num_warmup_steps - num_stable_steps) / num_decay_steps
+
+        decay_factor = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+
+        return min_lr_ratio + (1.0 - min_lr_ratio) * decay_factor
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
 def train_grpo(wandb_run):
     policy_model = AutoModelForCausalLM.from_pretrained(params.model_name, device_map="cuda", dtype=params.dtype)
     reference_model = AutoModelForCausalLM.from_pretrained(
@@ -344,7 +379,10 @@ def train_grpo(wandb_run):
 
     base_env = GuessTheNumberEnv(min_number=params.min_number, max_number=params.max_number, max_turns=params.max_turns)
 
-    optimizer = torch.optim.AdamW(policy_model.parameters(), params.learning_rate)
+    optimizer = torch.optim.AdamW(policy_model.parameters(), params.max_learning_rate)
+    wsd_scheduler = create_wsd_scheduler(
+        optimizer, total_steps=params.num_iterations * params.num_steps * params.num_grpo_iterations
+    )
 
     for iteration in range(1, params.num_iterations + 1):
         if iteration > 1:
@@ -352,8 +390,7 @@ def train_grpo(wandb_run):
             reference_model.load_state_dict(policy_model.state_dict())
 
         for step in range(1, params.num_steps + 1):
-            # Generate dataset for this step (num_prompts * num_outputs_per_prompt)
-            # Technically a batch in the GRPO paper
+            # Generate batch for this step (num_prompts * num_outputs_per_prompt)
             (
                 token_seqs,
                 loss_mask,
@@ -374,7 +411,8 @@ def train_grpo(wandb_run):
 
             total_size, _ = token_seqs.shape
 
-            # Inner loop - train multiple times on the same batch, each iteration == 1 optimization step
+            # Inner loop - train multiple times on the same batch, each iteration is 1 optimization step
+            # Split batch and accumulate gradients according to per_device_batch_size
             policy_model.train()
             num_batches = (total_size + params.per_device_batch_size - 1) // params.per_device_batch_size
             for grpo_iteration in range(1, params.num_grpo_iterations + 1):
@@ -436,20 +474,22 @@ def train_grpo(wandb_run):
                     acc_loss += loss.item()
                     acc_kl += kl_per_token.sum().item()
 
-                # Clip gradient norm, save unclipped for logging
+                # Clip gradient norm, optimizer + LR step
                 unclipped_grad_norm = torch.nn.utils.clip_grad_norm_(
                     policy_model.parameters(), params.max_grad_norm
                 ).item()
                 optimizer.step()
+                wsd_scheduler.step()
 
                 # Calculate metrics
                 avg_loss = acc_loss / num_batches
-                avg_kl = acc_kl / dataset_metrics["total_valid_tokens"]
+                avg_kl = acc_kl / loss_mask[:, 1:].sum().item()
                 metrics = {
                     "step": global_step,
                     "Loss/avg_total": avg_loss,
                     "Loss/avg_kl": avg_kl,
                     "unclipped_grad_norm": unclipped_grad_norm,
+                    "LR": optimizer.param_groups[0]["lr"],
                 }
 
                 # Log metrics to wandb + print
@@ -461,14 +501,18 @@ def train_grpo(wandb_run):
                 metrics |= dataset_metrics
 
                 tree = Tree(
-                    f"[bold yellow] Global step {global_step}, iteration {grpo_iteration}/{params.num_grpo_iterations} [/bold yellow]"
+                    f"[bold yellow] Global step {global_step}, "
+                    f"iteration {grpo_iteration}/{params.num_grpo_iterations} [/bold yellow]"
                 )
 
                 for k, v in metrics.items():
                     if k == "step":
                         continue
 
-                    formatted_val = f"{v:.4f}" if isinstance(v, float) else str(v)
+                    if isinstance(v, float):
+                        formatted_val = f"{v:.2e}" if (0 < v < 1e-3) else f"{v:.4f}"
+                    else:
+                        formatted_val = str(v)
                     tree.add(f"[cyan]{k}[/cyan]: {formatted_val}")
 
                 console.print(tree)
