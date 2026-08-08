@@ -21,42 +21,44 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 warnings.filterwarnings("ignore", message=".*tl.make_block_ptr is deprecated.*")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+# Split model_name to avoid repeat downloads
+MODEL_NAME = "Qwen/Qwen3.5-0.8B"
+
 
 @dataclass(frozen=True)
 class Parameters:
-    # Modal settings
-    model_name = "Qwen/Qwen3.5-0.8B"  # Tested Qwen3.5 only
-    use_thinking = False
-    gpu = "L4"
-    dtype = torch.bfloat16
-    timeout = 400  # seconds
-    wandb_project = "Simple RL for LLMs"
-    wandb_run_name = None
+    # Model/image settings
+    use_thinking: bool = True
+    gpu: str = "L4"
+    dtype: torch.dtype = torch.bfloat16
+    timeout: int = 900  # seconds
+    wandb_project: str = "SimpleGRPO"
+    wandb_run_name: str = "GRPO think (medium)"
 
     # GRPO settings
-    num_iterations = 1  # Outer loop, sync reference model
-    num_steps = 2  # Mid loop, sample prompts + outputs to train grpo_iterations times
-    num_grpo_iterations = 1  # Inner loop, GRPO update on step dataset (replay)
+    num_iterations: int = 4
+    num_steps: int = 5
+    num_grpo_iterations: int = 1
 
-    num_prompts_per_step = 4
-    num_outputs_per_prompt = 4
-    per_device_batch_size = 4
+    num_prompts_per_step: int = 4
+    num_outputs_per_prompt: int = 4
+    per_device_batch_size: int = 2
 
-    kl_beta = 0.05
-    importance_sampling_eps = 0.2
-    max_grad_norm = 2
+    kl_beta: float = 0.05
+    importance_sampling_eps: float = 0.2
+    max_grad_norm: float = 2.0
 
     # LR settings
-    max_learning_rate = 5e-6
-    min_learning_rate = 0
-    warmup_ratio = 0.05
-    decay_ratio = 0.1
+    max_learning_rate: float = 5e-6
+    min_learning_rate: float = 0.0
+    warmup_ratio: float = 0.1
+    decay_ratio: float = 0.1
 
     # Env settings
-    min_number = 1
-    max_number = 10
-    max_turns = 5
-    max_tokens_per_turn = 32
+    min_number: int = 1
+    max_number: int = 20
+    max_turns: int = 5
+    max_tokens_per_turn: int = 512
 
 
 params = Parameters()
@@ -67,7 +69,7 @@ def download_models():
     # Helper for Modal image caching
     from huggingface_hub import snapshot_download
 
-    snapshot_download(params.model_name)
+    snapshot_download(MODEL_NAME)
 
 
 kernel_volume = modal.Volume.from_name("kernel-cache", create_if_missing=True)
@@ -310,6 +312,7 @@ def get_rollouts(
         "Rewards/one rate": (all_rewards == 1).sum().item() / total_size,
         "Rewards/zero group rate": (reward_matrix <= 0).all(dim=1).float().mean().item(),
         "Rewards/one group rate": (reward_matrix == 1).all(dim=1).float().mean().item(),
+        "Rewards/passing group rate": (reward_matrix == 1).any(dim=1).float().mean().item(),
         "Quality/out of range turn count": sum(out_of_range_lst),
         "Quality/repeated turn count": sum(repeated_lst),
     }
@@ -377,11 +380,18 @@ def create_wsd_scheduler(optimizer, total_steps):
     num_stable_steps = int(stable_ratio * total_steps)
     num_decay_steps = total_steps - num_warmup_steps - num_stable_steps
 
+    tree = Tree(f"[bold yellow]LR decay steps (total steps = {total_steps})[/bold yellow]")
+    tree.add(f"Warmup steps = {num_warmup_steps}")
+    tree.add(f"Stable steps = {num_stable_steps}")
+    tree.add(f"Decay steps = {num_decay_steps}")
+
+    console.print(tree)
+
     min_lr_ratio = 0 if params.max_learning_rate == 0 else params.min_learning_rate / params.max_learning_rate
 
     def lr_lambda(current_step: int) -> float:
         if current_step < num_warmup_steps:
-            return current_step / num_warmup_steps
+            return (current_step + 1) / num_warmup_steps  # +1 to avoid 0 step
 
         if current_step < (num_warmup_steps + num_stable_steps):
             return 1.0
@@ -452,11 +462,9 @@ def run_grpo_microbatch(
 
 
 def train_grpo(wandb_run):
-    policy_model = AutoModelForCausalLM.from_pretrained(params.model_name, device_map="cuda", dtype=params.dtype)
-    reference_model = AutoModelForCausalLM.from_pretrained(
-        params.model_name, device_map="cpu", dtype=params.dtype
-    ).eval()
-    tokenizer = AutoTokenizer.from_pretrained(params.model_name)
+    policy_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="cuda", dtype=params.dtype)
+    reference_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="cpu", dtype=params.dtype).eval()
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.convert_tokens_to_ids("<|endoftext|>")
@@ -468,12 +476,12 @@ def train_grpo(wandb_run):
         optimizer, total_steps=params.num_iterations * params.num_steps * params.num_grpo_iterations
     )
 
-    for iteration in range(1, params.num_iterations + 1):
-        if iteration > 1:
+    for iteration in range(params.num_iterations):
+        if iteration > 0:
             print("Syncing reference model")
             reference_model.load_state_dict(policy_model.state_dict())
 
-        for step in range(1, params.num_steps + 1):
+        for step in range(params.num_steps):
             # Generate batch for this step (num_prompts * num_outputs_per_prompt)
             (
                 token_seqs,
@@ -499,10 +507,14 @@ def train_grpo(wandb_run):
             # Split batch and accumulate gradients according to per_device_batch_size
             policy_model.train()
             num_batches = (total_size + params.per_device_batch_size - 1) // params.per_device_batch_size
-            for grpo_iteration in range(1, params.num_grpo_iterations + 1):
+            for grpo_iteration in range(params.num_grpo_iterations):
                 acc_loss = 0.0
                 acc_kl = 0.0
-                global_step = step * params.num_grpo_iterations
+                global_step = (
+                    iteration * params.num_steps * params.num_grpo_iterations
+                    + step * params.num_grpo_iterations
+                    + params.num_grpo_iterations
+                )
 
                 optimizer.zero_grad()
                 for batch_idx in range(num_batches):
@@ -531,30 +543,30 @@ def train_grpo(wandb_run):
                     policy_model.parameters(), params.max_grad_norm
                 ).item()
                 optimizer.step()
+                current_lr = wsd_scheduler.get_last_lr()[0]
                 wsd_scheduler.step()
 
                 # Calculate metrics
                 avg_loss = acc_loss / num_batches
                 avg_kl = acc_kl / loss_mask[:, 1:].sum().item()
                 metrics = {
-                    "step": global_step,
                     "Loss/avg_total": avg_loss,
                     "Loss/avg_kl": avg_kl,
                     "unclipped_grad_norm": unclipped_grad_norm,
-                    "LR": optimizer.param_groups[0]["lr"],
+                    "LR": current_lr,
                 }
 
                 # Log metrics to wandb + print
-                if grpo_iteration == 1:
-                    wandb.log(metrics | dataset_metrics)
+                if grpo_iteration == 0:
+                    wandb_run.log(metrics | dataset_metrics)
                 else:
-                    wandb.log(metrics)
-
+                    wandb_run.log(metrics)
+                    wsd_scheduler.get_last_lr
                 metrics |= dataset_metrics
 
                 tree = Tree(
                     f"[bold yellow] Global step {global_step}, "
-                    f"iteration {grpo_iteration}/{params.num_grpo_iterations} [/bold yellow]"
+                    f"iteration {grpo_iteration}/{params.num_grpo_iterations - 1} [/bold yellow]"
                 )
 
                 for k, v in metrics.items():
@@ -577,7 +589,8 @@ def train_grpo(wandb_run):
     volumes={"/root/.triton": kernel_volume},
 )
 def train_grpo_with_wandb():
-    wandb_run = wandb.init(project=params.wandb_project, name=params.wandb_run_name, config=asdict(params))
+    wandb_run = wandb.init(project=params.wandb_project, name=params.wandb_run_name, 
+        config=asdict(params) | {"model": MODEL_NAME})
 
     try:
         train_grpo(wandb_run)

@@ -20,3 +20,4 @@
   - If a token gets a strong negative, that ratio explodes
   - Can clamp the log ratio further but the real fix is implementing importance sampling
 - Needing to mask out logprobs + importance sampling ratios!
+- Balancing number of groups and number of rollouts, advantage estimation quality vs diversity, easy vs hard tasks, prompt filtering
