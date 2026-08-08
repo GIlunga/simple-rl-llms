@@ -1,5 +1,6 @@
 import logging
 import math
+import re
 import warnings
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -24,7 +25,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 @dataclass(frozen=True)
 class Parameters:
     # Modal settings
-    model_name = "Qwen/Qwen3.5-0.8B"
+    model_name = "Qwen/Qwen3.5-0.8B"  # Tested Qwen3.5 only
+    use_thinking = False
     gpu = "L4"
     dtype = torch.bfloat16
     timeout = 400  # seconds
@@ -32,18 +34,19 @@ class Parameters:
     wandb_run_name = None
 
     # GRPO settings
-    num_iterations = 2  # Outer loop, sync reference model
+    num_iterations = 1  # Outer loop, sync reference model
     num_steps = 2  # Mid loop, sample prompts + outputs to train grpo_iterations times
     num_grpo_iterations = 1  # Inner loop, GRPO update on step dataset (replay)
 
-    num_prompts_per_step = 2
-    num_outputs_per_prompt = 2
+    num_prompts_per_step = 4
+    num_outputs_per_prompt = 4
     per_device_batch_size = 4
 
     kl_beta = 0.05
     importance_sampling_eps = 0.2
     max_grad_norm = 2
 
+    # LR settings
     max_learning_rate = 5e-6
     min_learning_rate = 0
     warmup_ratio = 0.05
@@ -137,11 +140,11 @@ def print_rollouts(
 def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
     message_list = [
         {
-            "content": "You are playing Guess The Number with the user. You have to guess the number between 1 and 10 "
-            "(inclusive) within 5 turns. As you enter your guess, the user will provide you with hints such as the "
-            "target number is 'higher' or 'lower'. When answering, only the number that is wrapped inside \\boxed{} "
-            "will be considered as your guess, for example, \\boxed{10}. Follow that exact format for your final "
-            "answer.",
+            "content": f"You are playing Guess The Number with the user. You have to guess the number between "
+            f"{params.min_number} and {params.max_number} (inclusive) within {params.max_turns} turns. As you enter "
+            "your guess, the user will provide you with hints such as the target number is 'higher' or 'lower'. "
+            "When answering, only the number that is wrapped inside \\boxed{} will be considered as your guess, "
+            "for example, \\boxed{1}. Follow that exact format for your final answer.",
             "role": "system",
         },
         {"content": "Enter your first guess to start the game!", "role": "user"},
@@ -152,9 +155,12 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
     terminated = False
     truncated = False
 
-    # Thinking = False adds a thinking section and closes it immediately
+    # Rollout quality metrics
+    rollout_guesses = []
+    out_of_range_count = 0
+
     inputs_text = tokenizer.apply_chat_template(
-        message_list, tokenize=False, enable_thinking=False, add_generation_prompt=True
+        message_list, tokenize=False, enable_thinking=params.use_thinking, add_generation_prompt=True
     )
 
     inputs = tokenizer(inputs_text, return_tensors="pt").to(model.device)
@@ -177,7 +183,7 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
                 eos_token_id=[tokenizer.eos_token_id, im_end_token],
             )
 
-        # Strip end of text
+        # Strip end of text for next turn
         if output_dict.sequences[0][-1] == end_of_text_token_id:
             output_dict.sequences = output_dict.sequences[:, :-1]
 
@@ -191,6 +197,16 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
         # Add new text
         observation_msg = {"role": "user", "content": observation}
         message_list.extend([{"role": "assistant", "content": text_response}, observation_msg])
+
+        # Compute rollout metrics
+        guess_matches = re.findall(r"\\boxed\{(\d+)\}", text_response)
+
+        if guess_matches:
+            current_guess = int(guess_matches[-1])
+            rollout_guesses.append(current_guess)
+
+            if params.max_number < current_guess < params.min_number:
+                out_of_range_count += 1
 
         if terminated or truncated:
             break
@@ -210,8 +226,10 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
         output_dict.sequences.detach().cpu(),
         torch.tensor(output_mask),
         reward,
-        reward == 1.0,
+        reward == 1,
         env.turn_count,
+        out_of_range_count,
+        len(rollout_guesses) - len(set(rollout_guesses)),
     )
 
 
@@ -231,14 +249,17 @@ def get_rollouts(
     advantage_lst = []
     won_lst = []
     turn_count_lst = []
+    out_of_range_lst = []
+    repeated_lst = []
 
     for _ in range(num_prompts_per_step):
         base_env.reset()
         # Required to maintain same target for guess the number (env copies share same target number)
         env_copies = [deepcopy(base_env) for _ in range(num_completions_per_prompt)]
         group_rewards = []
+
         for env in env_copies:
-            token_seq, output_mask, reward, won, turn_count = generate_single_rollout(
+            token_seq, output_mask, reward, won, turn_count, out_of_range_count, has_repeated = generate_single_rollout(
                 env, policy_model, tokenizer, max_tokens_per_turn
             )
 
@@ -247,6 +268,8 @@ def get_rollouts(
             group_rewards.append(reward)
             won_lst.append(won)
             turn_count_lst.append(turn_count)
+            out_of_range_lst.append(out_of_range_count)
+            repeated_lst.append(has_repeated)
 
         group_rewards = torch.tensor(group_rewards)
 
@@ -265,10 +288,13 @@ def get_rollouts(
 
     # Get logprobs for importance sampling + KL
     gen_policy_logprobs = get_logprobs_from_rollouts(policy_model, token_seqs, loss_mask, attn_mask)
+
+    reference_model.cuda()
     ref_model_logprobs = get_logprobs_from_rollouts(reference_model, token_seqs, loss_mask, attn_mask)
+    reference_model.cpu()
 
     # Compute dataset metrics
-    total_size, _ = token_seqs.shape
+    total_size = num_prompts_per_step * num_completions_per_prompt
     all_rewards = torch.cat(reward_lst)
     reward_matrix = all_rewards.view(-1, num_completions_per_prompt)
     rollout_lens = loss_mask[:, 1:].sum(dim=1)
@@ -280,10 +306,12 @@ def get_rollouts(
         "Rewards/std": all_rewards.std().item(),
         "Rewards/max": all_rewards.max().item(),
         "Rewards/min": all_rewards.min().item(),
-        "Rewards/zero_rate": (all_rewards <= 0).sum().item() / total_size,
-        "Rewards/one_rate": (all_rewards == 1).sum().item() / total_size,
-        "Rewards/zero_group_rate": (reward_matrix <= 0).all(dim=1).float().mean().item(),
-        "Rewards/one_group_rate": (reward_matrix == 1).all(dim=1).float().mean().item(),
+        "Rewards/zero rate": (all_rewards <= 0).sum().item() / total_size,
+        "Rewards/one rate": (all_rewards == 1).sum().item() / total_size,
+        "Rewards/zero group rate": (reward_matrix <= 0).all(dim=1).float().mean().item(),
+        "Rewards/one group rate": (reward_matrix == 1).all(dim=1).float().mean().item(),
+        "Quality/out of range turn count": sum(out_of_range_lst),
+        "Quality/repeated turn count": sum(repeated_lst),
     }
 
     # Print rollouts to stdout
@@ -349,7 +377,7 @@ def create_wsd_scheduler(optimizer, total_steps):
     num_stable_steps = int(stable_ratio * total_steps)
     num_decay_steps = total_steps - num_warmup_steps - num_stable_steps
 
-    min_lr_ratio = params.min_learning_rate / params.max_learning_rate
+    min_lr_ratio = 0 if params.max_learning_rate == 0 else params.min_learning_rate / params.max_learning_rate
 
     def lr_lambda(current_step: int) -> float:
         if current_step < num_warmup_steps:
@@ -367,10 +395,66 @@ def create_wsd_scheduler(optimizer, total_steps):
     return LambdaLR(optimizer, lr_lambda)
 
 
+def run_grpo_microbatch(
+    batch_inputs,
+    batch_attn_mask,
+    batch_loss_mask,
+    batch_advantages,
+    batch_old_logprobs,
+    batch_ref_logprobs,
+    policy_model,
+    total_size,
+):
+    batch_inputs = batch_inputs.cuda()
+    batch_attn_mask = batch_attn_mask.cuda()
+    batch_loss_mask = batch_loss_mask.cuda()
+    batch_advantages = batch_advantages.cuda()
+    batch_old_logprobs = batch_old_logprobs.cuda()
+    batch_ref_logprobs = batch_ref_logprobs.cuda()
+    targets = batch_inputs[:, 1:]
+
+    # Get current policy model logprobs
+    shifted_loss_mask = batch_loss_mask[:, 1:]  # Shift mask by 1 to match logprobs
+    policy_model_output = policy_model.forward(batch_inputs, attention_mask=batch_attn_mask)
+    policy_model_logprobs = get_logprobs_from_logits(policy_model_output, targets) * shifted_loss_mask
+
+    # Compute KL (K3 from http://joschu.net/blog/kl-approx.html)
+    # 1. Compute log(r) = log(pi_ref) - log(pi_theta)
+    log_r = torch.clamp(batch_ref_logprobs - policy_model_logprobs, max=2.0)
+
+    # 2. Compute r = pi_ref / pi_theta
+    r = torch.exp(log_r)
+
+    # 3. Apply the token-level k3 formula: (r - 1) - log(r)
+    kl_per_token = (r - 1.0) - log_r
+
+    # Calculate per token objective
+    ratio = torch.exp(policy_model_logprobs - batch_old_logprobs)
+    unclipped_obj = ratio * batch_advantages.unsqueeze(-1)
+    clipped_obj = torch.clamp(
+        ratio,
+        1.0 - params.importance_sampling_eps,
+        1.0 + params.importance_sampling_eps,
+    ) * batch_advantages.unsqueeze(-1)
+    policy_obj = torch.min(unclipped_obj, clipped_obj)
+
+    # Note: need to reapply mask because ratio (exp(0)) * advantages makes it non-zero!
+    per_token_obj = (policy_obj - params.kl_beta * kl_per_token) * shifted_loss_mask
+
+    # GRPO paper normalisation: normalise each completion by its own length, mean over P*G completions.
+    # Dividing each mini-batch contribution by total_completions and accumulating gives
+    # the same gradient as processing the full batch in one forward pass.
+    seq_lengths = shifted_loss_mask.sum(dim=1)
+    seq_objs = per_token_obj.sum(dim=1) / seq_lengths
+    loss = -seq_objs.sum() / total_size
+
+    return loss, kl_per_token.sum().item()
+
+
 def train_grpo(wandb_run):
     policy_model = AutoModelForCausalLM.from_pretrained(params.model_name, device_map="cuda", dtype=params.dtype)
     reference_model = AutoModelForCausalLM.from_pretrained(
-        params.model_name, device_map="cuda", dtype=params.dtype
+        params.model_name, device_map="cpu", dtype=params.dtype
     ).eval()
     tokenizer = AutoTokenizer.from_pretrained(params.model_name)
 
@@ -422,57 +506,25 @@ def train_grpo(wandb_run):
 
                 optimizer.zero_grad()
                 for batch_idx in range(num_batches):
-                    # Get batch from dataset
                     start_idx = batch_idx * params.per_device_batch_size
                     end_idx = (batch_idx + 1) * params.per_device_batch_size
 
-                    batch_inputs = token_seqs[start_idx:end_idx].cuda()
-                    batch_attn_mask = attn_mask[start_idx:end_idx].cuda()
-                    batch_loss_mask = loss_mask[start_idx:end_idx].cuda()
-                    batch_advantages = advantages[start_idx:end_idx].cuda()
-                    batch_old_logprobs = old_policy_logprobs[start_idx:end_idx].cuda()
-                    batch_ref_logprobs = ref_model_logprobs[start_idx:end_idx].cuda()
-                    targets = batch_inputs[:, 1:]
-
-                    # Get current policy model logprobs
-                    shifted_loss_mask = batch_loss_mask[:, 1:]  # Shift mask by 1 to match logprobs
-                    policy_model_output = policy_model.forward(batch_inputs, attention_mask=batch_attn_mask)
-                    policy_model_logprobs = get_logprobs_from_logits(policy_model_output, targets) * shifted_loss_mask
-
-                    # Compute KL (K3 from http://joschu.net/blog/kl-approx.html)
-                    # 1. Compute log(r) = log(pi_ref) - log(pi_theta)
-                    log_r = torch.clamp(batch_ref_logprobs - policy_model_logprobs, max=2.0)
-
-                    # 2. Compute r = pi_ref / pi_theta
-                    r = torch.exp(log_r)
-
-                    # 3. Apply the token-level k3 formula: (r - 1) - log(r)
-                    kl_per_token = (r - 1.0) - log_r
-
-                    # Calculate per token objective
-                    ratio = torch.exp(policy_model_logprobs - batch_old_logprobs)
-                    unclipped_obj = ratio * batch_advantages.unsqueeze(-1)
-                    clipped_obj = torch.clamp(
-                        ratio * batch_advantages.unsqueeze(-1),
-                        1.0 - params.importance_sampling_eps,
-                        1.0 + params.importance_sampling_eps,
+                    loss, kl_per_token = run_grpo_microbatch(
+                        token_seqs[start_idx:end_idx],
+                        attn_mask[start_idx:end_idx],
+                        loss_mask[start_idx:end_idx],
+                        advantages[start_idx:end_idx],
+                        old_policy_logprobs[start_idx:end_idx],
+                        ref_model_logprobs[start_idx:end_idx],
+                        policy_model,
+                        total_size,
                     )
-                    policy_obj = torch.min(unclipped_obj, clipped_obj)
 
-                    # Note: need to reapply mask because ratio (exp(0)) * advantages makes it non-zero!
-                    per_token_obj = (policy_obj - params.kl_beta * kl_per_token) * shifted_loss_mask
-
-                    # GRPO paper normalisation: normalise each completion by its own length, mean over P*G completions.
-                    # Dividing each mini-batch contribution by total_completions and accumulating gives
-                    # the same gradient as processing the full batch in one forward pass.
-                    seq_lengths = shifted_loss_mask.sum(dim=1)
-                    seq_objs = per_token_obj.sum(dim=1) / seq_lengths
-                    loss = -seq_objs.sum() / total_size
                     loss.backward()
 
                     # Accumulate metrics
                     acc_loss += loss.item()
-                    acc_kl += kl_per_token.sum().item()
+                    acc_kl += kl_per_token
 
                 # Clip gradient norm, optimizer + LR step
                 unclipped_grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -516,8 +568,6 @@ def train_grpo(wandb_run):
                     tree.add(f"[cyan]{k}[/cyan]: {formatted_val}")
 
                 console.print(tree)
-
-                # TODO: Save checkpoints
 
 
 @app.function(
