@@ -208,7 +208,7 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
             current_guess = int(guess_matches[-1])
             rollout_guesses.append(current_guess)
 
-            if params.max_number < current_guess < params.min_number:
+            if params.max_number < current_guess or current_guess < params.min_number:
                 out_of_range_count += 1
 
         if terminated or truncated:
@@ -225,6 +225,10 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
         output_mask += [False] * (inputs["input_ids"].shape[1] - output_dict.sequences.shape[1])
         prev_len = inputs["input_ids"].shape[1]
 
+    direction_events, wrong_direction_count = compute_direction_metrics(
+        rollout_guesses, env.min_number, env.max_number, env.game_number
+    )
+
     return (
         output_dict.sequences.detach().cpu(),
         torch.tensor(output_mask),
@@ -233,6 +237,8 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
         env.turn_count,
         out_of_range_count,
         len(rollout_guesses) - len(set(rollout_guesses)),
+        direction_events,
+        wrong_direction_count,
     )
 
 
@@ -254,6 +260,8 @@ def get_rollouts(
     turn_count_lst = []
     out_of_range_lst = []
     repeated_lst = []
+    wrong_direction_lst = []
+    direction_events_lst = []
 
     for _ in range(num_prompts_per_step):
         base_env.reset()
@@ -262,7 +270,17 @@ def get_rollouts(
         group_rewards = []
 
         for env in env_copies:
-            token_seq, output_mask, reward, won, turn_count, out_of_range_count, has_repeated = generate_single_rollout(
+            (
+                token_seq,
+                output_mask,
+                reward,
+                won,
+                turn_count,
+                out_of_range_count,
+                has_repeated,
+                direction_events,
+                wrong_direction_count,
+            ) = generate_single_rollout(
                 env, policy_model, tokenizer, max_tokens_per_turn
             )
 
@@ -273,6 +291,8 @@ def get_rollouts(
             turn_count_lst.append(turn_count)
             out_of_range_lst.append(out_of_range_count)
             repeated_lst.append(has_repeated)
+            direction_events_lst.append(direction_events)
+            wrong_direction_lst.append(wrong_direction_count)
 
         group_rewards = torch.tensor(group_rewards)
 
@@ -316,6 +336,7 @@ def get_rollouts(
         "Rewards/passing group rate": (reward_matrix == 1).any(dim=1).float().mean().item(),
         "Quality/out of range turn count": sum(out_of_range_lst),
         "Quality/repeated turn count": sum(repeated_lst),
+        "Quality/wrong direction rate": sum(wrong_direction_lst) / max(sum(direction_events_lst), 1),
     }
 
     # Print rollouts to stdout
@@ -373,6 +394,38 @@ def get_logprobs_from_logits(model_output, targets):
     return -F.cross_entropy(flat_logits, flat_targets, reduction="none").reshape(
         shifted_logits.shape[0], shifted_logits.shape[1]
     )
+
+
+def compute_direction_metrics(
+    guesses: list[int],
+    min_number,
+    max_number,
+    game_number,
+):
+    direction_events = 0
+    wrong_direction_count = 0
+
+    seen = set()
+    prev_was_directional = False
+    prev_guess = 0
+
+    for g in guesses:
+        if prev_was_directional:
+            direction_events += 1
+            hint_said_higher = prev_guess < game_number
+            if (hint_said_higher and g < prev_guess) or (not hint_said_higher and g > prev_guess):
+                wrong_direction_count += 1
+
+        if g < min_number or g > max_number:
+            prev_was_directional = False
+        elif g in seen:
+            prev_was_directional = False
+        else:
+            prev_was_directional = True
+            prev_guess = g
+            seen.add(g)
+
+    return direction_events, wrong_direction_count
 
 
 def create_wsd_scheduler(optimizer, total_steps):
@@ -562,7 +615,6 @@ def train_grpo(wandb_run):
                     wandb_run.log(metrics | dataset_metrics)
                 else:
                     wandb_run.log(metrics)
-                    wsd_scheduler.get_last_lr
                 metrics |= dataset_metrics
 
                 tree = Tree(
