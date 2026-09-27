@@ -2,7 +2,6 @@
 [project]
 name = "simple-rl-for-llms"
 version = "0.1.0"
-description = "A collection of training scripts for implementing reinforcement learning algorithms (GRPO, PPO, REINFORCE) to fine-tune large language models, built from scratch for educational purposes."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

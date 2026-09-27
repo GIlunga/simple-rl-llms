@@ -3,7 +3,6 @@
 The goal of this project is to implement the GRPO algorithm and test it on simple environments at small scale using Modal.
 
 ## Setup
-- Install uv, create env with uv sync, activate env
 - Run `modal setup`
 - Add a huggingface token to Modal secrets with the name `huggingface-secret`
 - Add a wanbd API key to Modal secrets with the name wand-secret

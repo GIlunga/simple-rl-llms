@@ -21,3 +21,4 @@
   - Can clamp the log ratio further but the real fix is implementing importance sampling
 - Needing to mask out logprobs + importance sampling ratios!
 - Balancing number of groups and number of rollouts, advantage estimation quality vs diversity, easy vs hard tasks, prompt filtering
+- Pass@K implementation - it is the prob that one rollout will be right given a budget of K rollouts, different from accuracy

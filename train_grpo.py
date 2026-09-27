@@ -29,6 +29,7 @@ MODEL_NAME = "Qwen/Qwen3.5-0.8B"
 class Parameters:
     # Model/image settings
     use_thinking: bool = True
+    temperature: float = 0.4
     gpu: str = "L4"
     dtype: torch.dtype = torch.bfloat16
     timeout: int = 900  # seconds
@@ -142,9 +143,9 @@ def print_rollouts(
 def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
     message_list = [
         {
-            "content": f"You are playing Guess The Number with the user. You have to guess the number between "
-            f"{params.min_number} and {params.max_number} (inclusive) within {params.max_turns} turns. As you enter "
-            "your guess, the user will provide you with hints such as the target number is 'higher' or 'lower'. "
+            "content": f"You are playing Guess The Number with the user. The user has a target number between "
+            f"{params.min_number} and {params.max_number} (inclusive) and you have to guess it as fast as possible." 
+            "When you enter a guess, the user will tell you if the target number is 'higher' or 'lower'. "
             "When answering, only the number that is wrapped inside \\boxed{} will be considered as your guess, "
             "for example, \\boxed{1}. Follow that exact format for your final answer.",
             "role": "system",
@@ -177,7 +178,7 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
             output_dict = model.generate(
                 **inputs,
                 max_new_tokens=max_tokens_per_turn,
-                temperature=1.0,
+                temperature=params.temperature,
                 do_sample=True,
                 use_cache=True,
                 return_dict_in_generate=True,
