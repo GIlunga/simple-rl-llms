@@ -28,17 +28,17 @@ MODEL_NAME = "Qwen/Qwen3.5-0.8B"
 @dataclass(frozen=True)
 class Parameters:
     # Model/image settings
-    use_thinking: bool = True
+    use_thinking: bool = False
     temperature: float = 0.4
     gpu: str = "L4"
     dtype: torch.dtype = torch.bfloat16
     timeout: int = 900  # seconds
     wandb_project: str = "SimpleGRPO"
-    wandb_run_name: str = "GRPO think (medium)"
+    wandb_run_name: str = "GRPO no think"
 
     # GRPO settings
-    num_iterations: int = 4
-    num_steps: int = 5
+    num_iterations: int = 1
+    num_steps: int = 2
     num_grpo_iterations: int = 1
 
     num_prompts_per_step: int = 4
@@ -60,6 +60,17 @@ class Parameters:
     max_number: int = 20
     max_turns: int = 5
     max_tokens_per_turn: int = 512
+
+
+@dataclass
+class RolloutMetrics:
+    reward: float
+    won: bool
+    turn_count: int
+    out_of_range_count: int
+    repeated_count: int
+    direction_events: int
+    wrong_direction_count: int
 
 
 params = Parameters()
@@ -140,7 +151,12 @@ def print_rollouts(
 
 
 # Actual GRPO algo
-def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
+def generate_single_rollout(
+    env: GuessTheNumberEnv,
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    max_tokens_per_turn: int,
+) -> tuple[torch.Tensor, torch.Tensor, float, int, list[int]]:
     message_list = [
         {
             "content": f"You are playing Guess The Number with the user. The user has a target number between "
@@ -158,9 +174,7 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
     terminated = False
     truncated = False
 
-    # Rollout quality metrics
     rollout_guesses = []
-    out_of_range_count = 0
 
     inputs_text = tokenizer.apply_chat_template(
         message_list, tokenize=False, enable_thinking=params.use_thinking, add_generation_prompt=True
@@ -208,9 +222,6 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
             current_guess = int(guess_matches[-1])
             rollout_guesses.append(current_guess)
 
-            if params.max_number < current_guess or current_guess < params.min_number:
-                out_of_range_count += 1
-
         if terminated or truncated:
             break
 
@@ -225,43 +236,30 @@ def generate_single_rollout(env, model, tokenizer, max_tokens_per_turn):
         output_mask += [False] * (inputs["input_ids"].shape[1] - output_dict.sequences.shape[1])
         prev_len = inputs["input_ids"].shape[1]
 
-    direction_events, wrong_direction_count = compute_direction_metrics(
-        rollout_guesses, env.min_number, env.max_number, env.game_number
-    )
-
     return (
         output_dict.sequences.detach().cpu(),
         torch.tensor(output_mask),
         reward,
-        reward == 1,
         env.turn_count,
-        out_of_range_count,
-        len(rollout_guesses) - len(set(rollout_guesses)),
-        direction_events,
-        wrong_direction_count,
+        rollout_guesses,
     )
 
 
 def get_rollouts(
-    base_env,
-    policy_model,
-    reference_model,
-    tokenizer,
-    max_tokens_per_turn,
-    num_prompts_per_step,
-    num_completions_per_prompt,
-):
+    base_env: GuessTheNumberEnv,
+    policy_model: AutoModelForCausalLM,
+    reference_model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    max_tokens_per_turn: int,
+    num_prompts_per_step: int,
+    num_completions_per_prompt: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float | int], torch.Tensor, torch.Tensor]:
     """Simple sequential multiple rollout generation for multiple prompts. No batching"""
     token_seq_lst = []
     output_mask_lst = []
     reward_lst = []
     advantage_lst = []
-    won_lst = []
-    turn_count_lst = []
-    out_of_range_lst = []
-    repeated_lst = []
-    wrong_direction_lst = []
-    direction_events_lst = []
+    metrics_lst: list[RolloutMetrics] = []
 
     for _ in range(num_prompts_per_step):
         base_env.reset()
@@ -270,29 +268,23 @@ def get_rollouts(
         group_rewards = []
 
         for env in env_copies:
-            (
-                token_seq,
-                output_mask,
-                reward,
-                won,
-                turn_count,
-                out_of_range_count,
-                has_repeated,
-                direction_events,
-                wrong_direction_count,
-            ) = generate_single_rollout(
+            token_seq, output_mask, reward, turn_count, guesses = generate_single_rollout(
                 env, policy_model, tokenizer, max_tokens_per_turn
             )
 
             token_seq_lst.append(token_seq.squeeze())
             output_mask_lst.append(output_mask)
             group_rewards.append(reward)
-            won_lst.append(won)
-            turn_count_lst.append(turn_count)
-            out_of_range_lst.append(out_of_range_count)
-            repeated_lst.append(has_repeated)
-            direction_events_lst.append(direction_events)
-            wrong_direction_lst.append(wrong_direction_count)
+            metrics_lst.append(
+                compute_rollout_metrics(
+                    guesses,
+                    reward,
+                    turn_count,
+                    env.min_number,
+                    env.max_number,
+                    env.game_number,
+                )
+            )
 
         group_rewards = torch.tensor(group_rewards)
 
@@ -317,27 +309,9 @@ def get_rollouts(
     reference_model.cpu()
 
     # Compute dataset metrics
-    total_size = num_prompts_per_step * num_completions_per_prompt
     all_rewards = torch.cat(reward_lst)
-    reward_matrix = all_rewards.view(-1, num_completions_per_prompt)
     rollout_lens = loss_mask[:, 1:].sum(dim=1)
-    dataset_metrics = {
-        "Rollout Len/avg": rollout_lens.mean().item(),
-        "Rollout Len/max": rollout_lens.max().item(),
-        "Rollout Len/min": rollout_lens.min().item(),
-        "Rewards/avg": all_rewards.mean().item(),
-        "Rewards/std": all_rewards.std().item(),
-        "Rewards/max": all_rewards.max().item(),
-        "Rewards/min": all_rewards.min().item(),
-        "Rewards/zero rate": (all_rewards <= 0).sum().item() / total_size,
-        "Rewards/one rate": (all_rewards == 1).sum().item() / total_size,
-        "Rewards/zero group rate": (reward_matrix <= 0).all(dim=1).float().mean().item(),
-        "Rewards/one group rate": (reward_matrix == 1).all(dim=1).float().mean().item(),
-        "Rewards/passing group rate": (reward_matrix == 1).any(dim=1).float().mean().item(),
-        "Quality/out of range turn count": sum(out_of_range_lst),
-        "Quality/repeated turn count": sum(repeated_lst),
-        "Quality/wrong direction rate": sum(wrong_direction_lst) / max(sum(direction_events_lst), 1),
-    }
+    dataset_metrics = compute_all_metrics(metrics_lst, rollout_lens, num_completions_per_prompt)
 
     # Print rollouts to stdout
     print_rollouts(
@@ -345,8 +319,8 @@ def get_rollouts(
         loss_mask,
         attn_mask,
         all_rewards,
-        won_lst,
-        turn_count_lst,
+        [m.won for m in metrics_lst],
+        [m.turn_count for m in metrics_lst],
         tokenizer,
         num_completions_per_prompt,
     )
@@ -396,12 +370,16 @@ def get_logprobs_from_logits(model_output, targets):
     )
 
 
-def compute_direction_metrics(
+def compute_rollout_metrics(
     guesses: list[int],
-    min_number,
-    max_number,
-    game_number,
-):
+    reward: float,
+    turn_count: int,
+    min_number: int,
+    max_number: int,
+    game_number: int,
+) -> RolloutMetrics:
+    """Compute all per-rollout count metrics from the parsed guesses and env params."""
+    out_of_range_count = 0
     direction_events = 0
     wrong_direction_count = 0
 
@@ -410,6 +388,9 @@ def compute_direction_metrics(
     prev_guess = 0
 
     for g in guesses:
+        if g < min_number or g > max_number:
+            out_of_range_count += 1
+
         if prev_was_directional:
             direction_events += 1
             hint_said_higher = prev_guess < game_number
@@ -425,7 +406,47 @@ def compute_direction_metrics(
             prev_guess = g
             seen.add(g)
 
-    return direction_events, wrong_direction_count
+    repeated_count = len(guesses) - len(set(guesses))
+
+    return RolloutMetrics(
+        reward=reward,
+        won=reward == 1,
+        turn_count=turn_count,
+        out_of_range_count=out_of_range_count,
+        repeated_count=repeated_count,
+        direction_events=direction_events,
+        wrong_direction_count=wrong_direction_count,
+    )
+
+
+def compute_all_metrics(
+    metrics: list[RolloutMetrics],
+    rollout_lens: torch.Tensor,
+    num_completions_per_prompt: int,
+) -> dict[str, float | int]:
+    """Aggregate per-rollout metrics into the dataset_metrics dict logged to wandb."""
+    total_size = len(metrics)
+    all_rewards = torch.tensor([m.reward for m in metrics])
+    reward_matrix = all_rewards.view(-1, num_completions_per_prompt)
+
+    return {
+        "Rollout Len/avg": rollout_lens.mean().item(),
+        "Rollout Len/max": rollout_lens.max().item(),
+        "Rollout Len/min": rollout_lens.min().item(),
+        "Rewards/avg": all_rewards.mean().item(),
+        "Rewards/std": all_rewards.std().item(),
+        "Rewards/max": all_rewards.max().item(),
+        "Rewards/min": all_rewards.min().item(),
+        "Rewards/zero rate": (all_rewards <= 0).sum().item() / total_size,
+        "Rewards/one rate": (all_rewards == 1).sum().item() / total_size,
+        "Rewards/zero group rate": (reward_matrix <= 0).all(dim=1).float().mean().item(),
+        "Rewards/one group rate": (reward_matrix == 1).all(dim=1).float().mean().item(),
+        "Rewards/passing group rate": (reward_matrix == 1).any(dim=1).float().mean().item(),
+        "Quality/out of range turn count": sum(m.out_of_range_count for m in metrics),
+        "Quality/repeated turn count": sum(m.repeated_count for m in metrics),
+        "Quality/wrong direction rate": sum(m.wrong_direction_count for m in metrics)
+        / max(sum(m.direction_events for m in metrics), 1),
+    }
 
 
 def create_wsd_scheduler(optimizer, total_steps):
