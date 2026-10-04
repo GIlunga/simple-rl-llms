@@ -1,12 +1,12 @@
+from __future__ import annotations
+
 import logging
 import math
 import warnings
-from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING
 
-import modal
 import torch
 import torch.nn.functional as F
-import wandb
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -16,75 +16,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from env import EnvConfig, GuessTheNumberEnv, RolloutMetrics, compute_env_metrics
 
+if TYPE_CHECKING:
+    from train import Parameters
+
 # Disable annoying prints
 warnings.filterwarnings("ignore", message=".*tl.make_block_ptr is deprecated.*")
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-# Split model_name to avoid repeat downloads on param changes
-MODEL_NAME = "Qwen/Qwen3.5-0.8B"
-
-
-@dataclass(frozen=True)
-class Parameters:
-    # Model/image settings
-    use_thinking: bool = False
-    temperature: float = 0.4
-    gpu: str = "L4"
-    dtype: torch.dtype = torch.bfloat16
-    timeout: int = 900  # seconds
-    wandb_project: str = "SimpleGRPO"
-    wandb_run_name: str = "GRPO no think"
-
-    # GRPO settings
-    num_iterations: int = 1
-    num_steps: int = 2
-    num_grpo_iterations: int = 1
-
-    num_prompts_per_step: int = 4
-    num_outputs_per_prompt: int = 4
-    per_device_batch_size: int = 2
-
-    kl_beta: float = 0.05
-    importance_sampling_eps: float = 0.2
-    max_grad_norm: float = 2.0
-
-    # LR settings
-    max_learning_rate: float = 5e-6
-    min_learning_rate: float = 0.0
-    warmup_ratio: float = 0.1
-    decay_ratio: float = 0.1
-
-    # Env settings
-    min_number: int = 1
-    max_number: int = 20
-    max_turns: int = 6
-    max_tokens_per_turn: int = 512
-
-    # Reward settings
-    reward_type: str = "binary"
-    format_error_reward: float = 0.0
-    invalid_action_reward: float = 0.0
-    reward_breakdown_turns: tuple[int, ...] = (4, 5, 6)
-
-
-params = Parameters()
-
-# Modal image definition
-def download_models():
-    # Helper for Modal image caching
-    from huggingface_hub import snapshot_download
-
-    snapshot_download(MODEL_NAME)
-
-
-kernel_volume = modal.Volume.from_name("kernel-cache", create_if_missing=True)
-image = (
-    modal.Image.from_registry("nvidia/cuda:13.0.0-devel-ubuntu22.04", add_python="3.12")
-    .apt_install("build-essential", "clang")
-    .uv_sync()
-    .run_function(download_models, secrets=[modal.Secret.from_name("huggingface-secret")])
-)
-app = modal.App("llm-rl-test", image=image)
 
 
 # Visualisation
@@ -149,6 +86,7 @@ def generate_single_rollout(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     max_tokens_per_turn: int,
+    params: Parameters,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     message_list = [
         {"content": env.system_prompt, "role": "system"},
@@ -225,6 +163,7 @@ def get_rollouts(
     max_tokens_per_turn: int,
     num_prompts_per_step: int,
     num_completions_per_prompt: int,
+    params: Parameters,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float | int], torch.Tensor, torch.Tensor]:
     """Simple sequential multiple rollout generation for multiple prompts. No batching"""
     token_seq_lst = []
@@ -242,7 +181,7 @@ def get_rollouts(
 
         for env in env_copies:
             token_seq, output_mask, _ = generate_single_rollout(
-                env, policy_model, tokenizer, max_tokens_per_turn
+                env, policy_model, tokenizer, max_tokens_per_turn, params
             )
 
             # Compute rewards (all turn budgets from the same trajectory)
@@ -271,10 +210,10 @@ def get_rollouts(
     loss_mask = (loss_mask & attn_mask).float()
 
     # Get logprobs for importance sampling + KL
-    gen_policy_logprobs = get_logprobs_from_rollouts(policy_model, token_seqs, loss_mask, attn_mask)
+    gen_policy_logprobs = get_logprobs_from_rollouts(policy_model, token_seqs, loss_mask, attn_mask, params)
 
     reference_model.cuda()
-    ref_model_logprobs = get_logprobs_from_rollouts(reference_model, token_seqs, loss_mask, attn_mask)
+    ref_model_logprobs = get_logprobs_from_rollouts(reference_model, token_seqs, loss_mask, attn_mask, params)
     reference_model.cpu()
 
     # Compute dataset metrics
@@ -309,7 +248,13 @@ def get_rollouts(
     )
 
 
-def get_logprobs_from_rollouts(policy_model, token_seqs, loss_mask, attn_mask):
+def get_logprobs_from_rollouts(
+    policy_model: AutoModelForCausalLM,
+    token_seqs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    attn_mask: torch.Tensor,
+    params: Parameters,
+) -> torch.Tensor:
     total_size, _ = token_seqs.shape
     num_batches = (total_size + params.per_device_batch_size - 1) // params.per_device_batch_size
     old_policy_logprobs_list = []
@@ -343,7 +288,7 @@ def get_logprobs_from_logits(model_output, targets):
     )
 
 
-def create_wsd_scheduler(optimizer, total_steps):
+def create_wsd_scheduler(optimizer, total_steps, params: Parameters):
     num_warmup_steps = int(params.warmup_ratio * total_steps)
     stable_ratio = 1 - params.warmup_ratio - params.decay_ratio
     num_stable_steps = int(stable_ratio * total_steps)
@@ -383,6 +328,7 @@ def run_grpo_microbatch(
     batch_ref_logprobs,
     policy_model,
     total_size,
+    params: Parameters,
 ):
     batch_inputs = batch_inputs.cuda()
     batch_attn_mask = batch_attn_mask.cuda()
@@ -430,10 +376,12 @@ def run_grpo_microbatch(
     return loss, kl_per_token.sum().item()
 
 
-def train_grpo(wandb_run):
-    policy_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="cuda", dtype=params.dtype)
-    reference_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="cpu", dtype=params.dtype).eval()
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+def train(params: Parameters, wandb_run) -> None:
+    policy_model = AutoModelForCausalLM.from_pretrained(params.model_name, device_map="cuda", dtype=params.dtype)
+    reference_model = AutoModelForCausalLM.from_pretrained(
+        params.model_name, device_map="cpu", dtype=params.dtype
+    ).eval()
+    tokenizer = AutoTokenizer.from_pretrained(params.model_name)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.convert_tokens_to_ids("<|endoftext|>")
@@ -454,7 +402,7 @@ def train_grpo(wandb_run):
 
     optimizer = torch.optim.AdamW(policy_model.parameters(), params.max_learning_rate)
     wsd_scheduler = create_wsd_scheduler(
-        optimizer, total_steps=params.num_iterations * params.num_steps * params.num_grpo_iterations
+        optimizer, params.num_iterations * params.num_steps * params.num_grpo_iterations, params
     )
 
     for iteration in range(params.num_iterations):
@@ -480,6 +428,7 @@ def train_grpo(wandb_run):
                 params.max_tokens_per_turn,
                 params.num_prompts_per_step,
                 params.num_outputs_per_prompt,
+                params,
             )
 
             total_size, _ = token_seqs.shape
@@ -511,6 +460,7 @@ def train_grpo(wandb_run):
                         ref_model_logprobs[start_idx:end_idx],
                         policy_model,
                         total_size,
+                        params,
                     )
 
                     loss.backward()
@@ -560,19 +510,3 @@ def train_grpo(wandb_run):
                     tree.add(f"[cyan]{k}[/cyan]: {formatted_val}")
 
                 console.print(tree)
-
-
-@app.function(
-    gpu=params.gpu,
-    timeout=params.timeout,
-    secrets=[modal.Secret.from_name("huggingface-secret"), modal.Secret.from_name("wandb-secret")],
-    volumes={"/root/.triton": kernel_volume},
-)
-def train_grpo_with_wandb():
-    wandb_run = wandb.init(project=params.wandb_project, name=params.wandb_run_name, 
-        config=asdict(params) | {"model": MODEL_NAME})
-
-    try:
-        train_grpo(wandb_run)
-    finally:
-        wandb.finish()

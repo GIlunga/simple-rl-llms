@@ -4,13 +4,21 @@ GRPO training for a small LLM on the "guess the number" game, run on Modal GPUs.
 
 ## Layout
 - `env.py` — the guess-the-number environment (parsing, observations, termination) plus the integrated reward system (`GuessTheNumberEnv.score`) and env metrics (`env.metrics`, `compute_env_metrics`).
-- `train_grpo.py` — the whole trainer (env rollouts, GRPO objective, logging, Modal image/app). All hyperparameters live in the `Parameters` dataclass at the top.
+- `grpo.py` — the trainer (env rollouts, GRPO objective, logging). All hyperparameters are passed in as a `Parameters` argument; no Modal/wandb-init code here.
+- `train.py` — the entrypoint. Holds the `Parameters` dataclass, the Modal image/app, and both the local and Modal run paths. Calls `grpo.train(params, wandb_run)`.
+- `build_helpers.py` — `MODEL_NAME` plus the `download_models` build helper used by the Modal image. Kept out of `train.py` so the image build step doesn't import the training code (see below).
 - `Notes.md` — known bugs/caveats from experiments (masking, KL, normalization).
 - `pyproject.toml` — uv project; deps pinned (torch from cu126 index, modal, wandb).
 
 ## Running
-- `modal run train_grpo.py` (first run is slow: Triton kernel compilation; kernels are cached in the `kernel-cache` volume at `/root/.triton`).
+- `modal run train.py` — runs on Modal GPUs (first run is slow: Triton kernel compilation; kernels are cached in the `kernel-cache` volume at `/root/.triton`).
+- `uv run train.py` (or `python train.py`) — runs locally via the `__main__` block.
 - Local dev: `uv sync` / `uv run`; lint with ruff (line-length 120).
+
+## Modal image / imports
+- The image is built as `...uv_sync().run_function(download_models, ...).add_local_python_source("env", "grpo")`. The local-source mounts must come **last** (Modal forbids build steps after `add_local_*` unless `copy=True`).
+- `download_models` lives in `build_helpers.py` so the `run_function` build step imports only that module. If it lived in `train.py`, the build would import `train.py` and thus `grpo`/`env` before they are mounted — the original `ModuleNotFoundError: No module named 'env'`.
+- `env` and `grpo` must be listed in `add_local_python_source`: the entrypoint is run as a single file, so Modal only auto-mounts `train.py`, not sibling modules.
 
 ## Key implementation details
 - Rollout generation is sequential per prompt: `num_prompts_per_step` fresh envs, `num_outputs_per_prompt` copies of one env (copies share the same target number — `base_env.clone()`).
