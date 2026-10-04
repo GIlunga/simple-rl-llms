@@ -2,6 +2,7 @@ import logging
 import math
 import re
 import warnings
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 
@@ -21,7 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 warnings.filterwarnings("ignore", message=".*tl.make_block_ptr is deprecated.*")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Split model_name to avoid repeat downloads
+# Split model_name to avoid repeat downloads on param changes
 MODEL_NAME = "Qwen/Qwen3.5-0.8B"
 
 
@@ -58,8 +59,14 @@ class Parameters:
     # Env settings
     min_number: int = 1
     max_number: int = 20
-    max_turns: int = 5
+    max_turns: int = 6
     max_tokens_per_turn: int = 512
+
+    # Reward settings
+    reward_type: str = "binary"
+    format_error_reward: float = 0.0
+    invalid_action_reward: float = 0.0
+    reward_breakdown_turns: tuple[int, ...] = (4, 5, 6)
 
 
 @dataclass
@@ -71,10 +78,10 @@ class RolloutMetrics:
     repeated_count: int
     direction_events: int
     wrong_direction_count: int
+    reward_by_max_turns: dict[int, float]
 
 
 params = Parameters()
-
 
 # Modal image definition
 def download_models():
@@ -156,7 +163,7 @@ def generate_single_rollout(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     max_tokens_per_turn: int,
-) -> tuple[torch.Tensor, torch.Tensor, float, int, list[int]]:
+) -> tuple[torch.Tensor, torch.Tensor, int, list[int | None]]:
     message_list = [
         {
             "content": f"You are playing Guess The Number with the user. The user has a target number between "
@@ -174,7 +181,7 @@ def generate_single_rollout(
     terminated = False
     truncated = False
 
-    rollout_guesses = []
+    turn_guesses = []
 
     inputs_text = tokenizer.apply_chat_template(
         message_list, tokenize=False, enable_thinking=params.use_thinking, add_generation_prompt=True
@@ -206,7 +213,7 @@ def generate_single_rollout(
 
         # Env step
         text_response = tokenizer.decode(output_dict.sequences[0][prev_len:], skip_special_tokens=True)
-        observation, reward, terminated, truncated, _ = env.step(text_response)
+        observation, _, terminated, truncated, _ = env.step(text_response)
 
         # Update mask with model response
         output_mask += [True] * (output_dict.sequences.shape[1] - prev_len)
@@ -217,10 +224,8 @@ def generate_single_rollout(
 
         # Compute rollout metrics
         guess_matches = re.findall(r"\\boxed\{(\d+)\}", text_response)
-
-        if guess_matches:
-            current_guess = int(guess_matches[-1])
-            rollout_guesses.append(current_guess)
+        current_guess = int(guess_matches[-1]) if guess_matches else None
+        turn_guesses.append(current_guess)
 
         if terminated or truncated:
             break
@@ -239,9 +244,8 @@ def generate_single_rollout(
     return (
         output_dict.sequences.detach().cpu(),
         torch.tensor(output_mask),
-        reward,
         env.turn_count,
-        rollout_guesses,
+        turn_guesses,
     )
 
 
@@ -261,6 +265,8 @@ def get_rollouts(
     advantage_lst = []
     metrics_lst: list[RolloutMetrics] = []
 
+    budgets = list(params.reward_breakdown_turns)
+
     for _ in range(num_prompts_per_step):
         base_env.reset()
         # Required to maintain same target for guess the number (env copies share same target number)
@@ -268,17 +274,28 @@ def get_rollouts(
         group_rewards = []
 
         for env in env_copies:
-            token_seq, output_mask, reward, turn_count, guesses = generate_single_rollout(
+            token_seq, output_mask, turn_count, turn_guesses = generate_single_rollout(
                 env, policy_model, tokenizer, max_tokens_per_turn
             )
+
+            # Compute rewards
+            rewards_by_turn = score_trajectory(
+                turn_guesses,
+                env.game_number,
+                env.min_number,
+                env.max_number,
+                budgets,
+            )
+            # Training reward uses the max training budget
+            reward = rewards_by_turn[params.max_turns]
 
             token_seq_lst.append(token_seq.squeeze())
             output_mask_lst.append(output_mask)
             group_rewards.append(reward)
             metrics_lst.append(
                 compute_rollout_metrics(
-                    guesses,
-                    reward,
+                    turn_guesses,
+                    rewards_by_turn,
                     turn_count,
                     env.min_number,
                     env.max_number,
@@ -370,15 +387,70 @@ def get_logprobs_from_logits(model_output, targets):
     )
 
 
+def score_trajectory(
+    turn_guesses: list[int | None],
+    target: int,
+    min_number: int,
+    max_number: int,
+    budgets: Sequence[int],
+) -> dict[int, float]:
+    sorted_budgets = sorted(budgets)
+    budget_set = set(sorted_budgets)
+
+    results: dict[int, float] = {}
+    terminal_reward: float | None = None
+    last_guess: int | None = None  # last parseable guess
+
+    for turn in range(1, sorted_budgets[-1] + 1):
+        if terminal_reward is None and turn <= len(turn_guesses):
+            guess = turn_guesses[turn - 1]
+            if guess is None:
+                terminal_reward = params.format_error_reward
+            elif guess == target:
+                terminal_reward = 1.0
+            else:
+                last_guess = guess
+
+        if turn in budget_set:
+            results[turn] = (
+                terminal_reward
+                if terminal_reward is not None
+                else _truncation_reward(last_guess, target, min_number, max_number)
+            )
+
+    return results
+
+
+def _truncation_reward(
+    last_guess: int | None,
+    target: int,
+    min_number: int,
+    max_number: int,
+) -> float:
+    if last_guess is None:
+        return params.format_error_reward
+
+    if params.reward_type == "binary":
+        return 0.0
+
+    # Dense case, give partial credit on the final guess
+    if last_guess < min_number or last_guess > max_number:
+        return params.invalid_action_reward
+    return 1.0 - abs(last_guess - target) / (max_number - min_number)
+
+
 def compute_rollout_metrics(
-    guesses: list[int],
-    reward: float,
+    turn_guesses: list[int | None],
+    reward_by_max_turns: dict[int, float],
     turn_count: int,
     min_number: int,
     max_number: int,
     game_number: int,
 ) -> RolloutMetrics:
     """Compute all per-rollout count metrics from the parsed guesses and env params."""
+    guesses = [g for g in turn_guesses if g is not None]
+    reward = reward_by_max_turns[params.max_turns]
+
     out_of_range_count = 0
     direction_events = 0
     wrong_direction_count = 0
@@ -416,6 +488,7 @@ def compute_rollout_metrics(
         repeated_count=repeated_count,
         direction_events=direction_events,
         wrong_direction_count=wrong_direction_count,
+        reward_by_max_turns=reward_by_max_turns,
     )
 
 
@@ -426,27 +499,33 @@ def compute_all_metrics(
 ) -> dict[str, float | int]:
     """Aggregate per-rollout metrics into the dataset_metrics dict logged to wandb."""
     total_size = len(metrics)
-    all_rewards = torch.tensor([m.reward for m in metrics])
-    reward_matrix = all_rewards.view(-1, num_completions_per_prompt)
 
-    return {
+    out = {
         "Rollout Len/avg": rollout_lens.mean().item(),
         "Rollout Len/max": rollout_lens.max().item(),
         "Rollout Len/min": rollout_lens.min().item(),
-        "Rewards/avg": all_rewards.mean().item(),
-        "Rewards/std": all_rewards.std().item(),
-        "Rewards/max": all_rewards.max().item(),
-        "Rewards/min": all_rewards.min().item(),
-        "Rewards/zero rate": (all_rewards <= 0).sum().item() / total_size,
-        "Rewards/one rate": (all_rewards == 1).sum().item() / total_size,
-        "Rewards/zero group rate": (reward_matrix <= 0).all(dim=1).float().mean().item(),
-        "Rewards/one group rate": (reward_matrix == 1).all(dim=1).float().mean().item(),
-        "Rewards/passing group rate": (reward_matrix == 1).any(dim=1).float().mean().item(),
         "Quality/out of range turn count": sum(m.out_of_range_count for m in metrics),
         "Quality/repeated turn count": sum(m.repeated_count for m in metrics),
         "Quality/wrong direction rate": sum(m.wrong_direction_count for m in metrics)
         / max(sum(m.direction_events for m in metrics), 1),
     }
+
+    # Reward metrics for every turn budget
+    budgets = sorted({budget for m in metrics for budget in m.reward_by_max_turns})
+    for budget in budgets:
+        budget_rewards = torch.tensor([m.reward_by_max_turns[budget] for m in metrics])
+        reward_matrix = budget_rewards.view(-1, num_completions_per_prompt)
+        out |= {
+            f"Rewards@{budget}/avg": budget_rewards.mean().item(),
+            f"Rewards@{budget}/std": budget_rewards.std().item(),
+            f"Rewards@{budget}/zero rate": (budget_rewards <= 0).sum().item() / total_size,
+            f"Rewards@{budget}/one rate": (budget_rewards == 1).sum().item() / total_size,
+            f"Rewards@{budget}/zero group rate": (reward_matrix <= 0).all(dim=1).float().mean().item(),
+            f"Rewards@{budget}/one group rate": (reward_matrix == 1).all(dim=1).float().mean().item(),
+            f"Rewards@{budget}/passing group rate": (reward_matrix == 1).any(dim=1).float().mean().item(),
+        }
+
+    return out
 
 
 def create_wsd_scheduler(optimizer, total_steps):
@@ -544,7 +623,14 @@ def train_grpo(wandb_run):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.convert_tokens_to_ids("<|endoftext|>")
 
-    base_env = GuessTheNumberEnv(min_number=params.min_number, max_number=params.max_number, max_turns=params.max_turns)
+    if params.max_turns not in params.reward_breakdown_turns:
+        raise ValueError("params.max_turns must be one of params.reward_breakdown_turns")
+
+    base_env = GuessTheNumberEnv(
+        min_number=params.min_number,
+        max_number=params.max_number,
+        max_turns=max(params.reward_breakdown_turns),
+    )
 
     optimizer = torch.optim.AdamW(policy_model.parameters(), params.max_learning_rate)
     wsd_scheduler = create_wsd_scheduler(
