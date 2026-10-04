@@ -79,7 +79,7 @@ def download_models():
 
 kernel_volume = modal.Volume.from_name("kernel-cache", create_if_missing=True)
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.6.0-devel-ubuntu22.04", add_python="3.12")
+    modal.Image.from_registry("nvidia/cuda:13.0.0-devel-ubuntu22.04", add_python="3.12")
     .apt_install("build-essential", "clang")
     .uv_sync()
     .run_function(download_models, secrets=[modal.Secret.from_name("huggingface-secret")])

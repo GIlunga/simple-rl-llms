@@ -6,11 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "transformers>=5,<6",
-    "torch>=2.7.0",
-    "wandb>=0.23.1",
+    "torch==2.14.1",
     "accelerate>1,<2",
     "modal>=1.4.2",
-    "causal-conv1d",
+    "causal-conv1d==1.7.0+cu.13.0.torch.2.14",
     "flash-linear-attention[cuda]>=0.5,<0.6",
     "wandb==0.28.1"
 ]
@@ -24,17 +23,19 @@ dev = [
     "ruff>=0.14.0",
 ]
 
-[tool.uv]
-# Disable isolation strictly for causal-conv1d
-no-build-isolation-package = ["causal-conv1d"]
-
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu126"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "astral"
+url = "https://wheels.astral.sh/simple/cu130/"
 explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch" }
+causal-conv1d = { index = "astral" }
 
 [tool.ruff]
 line-length = 120
