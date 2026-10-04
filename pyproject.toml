@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "transformers>=5,<6",
-    "gem-llm==0.1.0",
     "torch>=2.7.0",
     "wandb>=0.23.1",
     "accelerate>1,<2",
