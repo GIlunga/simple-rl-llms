@@ -11,7 +11,8 @@ dependencies = [
     "modal>=1.4.2",
     "causal-conv1d==1.7.0+cu.13.0.torch.2.14",
     "flash-linear-attention[cuda]>=0.5,<0.6",
-    "wandb==0.28.1"
+    "wandb==0.28.1",
+    "tqdm>=4.69.0",
 ]
 
 [dependency-groups]

@@ -66,8 +66,8 @@ class GuessTheNumberEnv:
     def initial_message(self) -> str:
         return "Enter your first guess to start the game!"
 
-    def reset(self) -> str:
-        self.target = random.randint(self.min_number, self.max_number)
+    def reset(self, target: int | None = None) -> str:
+        self.target = target if target is not None else random.randint(self.min_number, self.max_number)
         self.turn_count = 0
         self.previous_guesses = set()
         self.guesses = []
@@ -214,7 +214,6 @@ def compute_env_metrics(
     metrics: list[RolloutMetrics],
     num_completions_per_prompt: int,
 ) -> dict[str, float | int]:
-    """Aggregate per-rollout env metrics into the wandb ``dataset_metrics`` dict."""
     total_size = len(metrics)
 
     out: dict[str, float | int] = {

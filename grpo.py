@@ -7,11 +7,14 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
+import wandb
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 from torch.optim.lr_scheduler import LambdaLR
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from env import EnvConfig, GuessTheNumberEnv, RolloutMetrics, compute_env_metrics
@@ -248,6 +251,107 @@ def get_rollouts(
     )
 
 
+def pass_at_k(num_samples: int, num_correct: int, k: int) -> float:
+    """Unbiased pass@k estimator: probability at least one of k samples is correct."""
+    if k > num_samples:
+        raise ValueError(f"pass@k requires k <= num_samples, got k={k}, num_samples={num_samples}")
+    if num_correct == 0:
+        return 0.0
+    return 1.0 - math.comb(num_samples - num_correct, k) / math.comb(num_samples, k)
+
+
+def evaluate_test_set(
+    base_env: GuessTheNumberEnv,
+    policy_model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    params: Parameters,
+    wandb_run,
+) -> dict[str, float]:
+    budgets = sorted(params.reward_breakdown_turns)
+    max_k = max(params.eval_pass_at_k)
+    if max_k > params.eval_num_rollouts:
+        raise ValueError(
+            f"eval_pass_at_k max ({max_k}) cannot exceed eval_num_rollouts ({params.eval_num_rollouts})"
+        )
+
+    policy_model.eval()
+
+    per_target_metrics: dict[int, list[RolloutMetrics]] = {}
+    total_rollouts = len(params.eval_numbers) * params.eval_num_rollouts
+    with tqdm(total=total_rollouts, desc="Test set rollouts") as progress:
+        for target in params.eval_numbers:
+            base_env.reset(target=target)
+            env_copies = [base_env.clone() for _ in range(params.eval_num_rollouts)]
+            metrics_lst: list[RolloutMetrics] = []
+            for env in env_copies:
+                generate_single_rollout(env, policy_model, tokenizer, params.max_tokens_per_turn, params)
+                metrics_lst.append(env.metrics(params.max_turns))
+                num_won = sum(1 for m in metrics_lst if m.won)
+                progress.update(1)
+                progress.set_postfix(target=target, won=f"{num_won}/{len(metrics_lst)}")
+            per_target_metrics[target] = metrics_lst
+
+    # Per-target, per-budget accuracy and pass@K
+    accuracy_rows: list[list[float | int]] = []
+    pass_k_rows: list[list[float | int]] = []
+    for target, metrics_lst in per_target_metrics.items():
+        for budget in budgets:
+            rewards = [m.reward_by_max_turns[budget] for m in metrics_lst]
+            num_samples = len(rewards)
+            num_correct = sum(1 for reward in rewards if reward == 1.0)
+            accuracy_rows.append([target, budget, num_correct / num_samples])
+            for k in params.eval_pass_at_k:
+                pass_k_rows.append([target, budget, k, pass_at_k(num_samples, num_correct, k)])
+
+    # One pass@K chart per budget (a line per target)
+    for budget in budgets:
+        rows = [[row[2], row[0], row[3]] for row in pass_k_rows if row[1] == budget]
+        pass_k_table = wandb.Table(columns=["k", "target", "pass@k"], data=rows)
+        wandb_run.log(
+            {
+                f"Eval/pass@k@{budget}": wandb.plot.line(
+                    pass_k_table, "k", "pass@k", stroke="target", title=f"pass@K @ {budget} turns"
+                ),
+                f"Eval/pass@k@{budget}/table": pass_k_table,
+            }
+        )
+
+    # One accuracy chart (a line per budget)
+    accuracy_table = wandb.Table(columns=["target", "budget", "accuracy"], data=accuracy_rows)
+    wandb_run.log(
+        {
+            "Eval/accuracy": wandb.plot.line(
+                accuracy_table, "target", "accuracy", stroke="budget", title="Accuracy per number"
+            ),
+            "Eval/accuracy/table": accuracy_table,
+        }
+    )
+
+    # Aggregate scalars (mean over targets)
+    metrics: dict[str, float] = {}
+    for budget in budgets:
+        accuracies = [row[2] for row in accuracy_rows if row[1] == budget]
+        metrics[f"Eval/accuracy@{budget}"] = sum(accuracies) / len(accuracies)
+        for k in params.eval_pass_at_k:
+            pass_ks = [row[3] for row in pass_k_rows if row[1] == budget and row[2] == k]
+            metrics[f"Eval/pass@{k}@{budget}"] = sum(pass_ks) / len(pass_ks)
+
+    # Print summary
+    summary_table = Table(title="Test set accuracy per target")
+    summary_table.add_column("Target")
+    for budget in budgets:
+        summary_table.add_column(f"{budget} turns")
+    for target in params.eval_numbers:
+        cells = []
+        for budget in budgets:
+            accuracy = next(row[2] for row in accuracy_rows if row[0] == target and row[1] == budget)
+            cells.append(f"{accuracy:.2f}")
+        summary_table.add_row(str(target), *cells)
+    console.print(summary_table)
+
+    return metrics
+
+
 def get_logprobs_from_rollouts(
     policy_model: AutoModelForCausalLM,
     token_seqs: torch.Tensor,
@@ -378,9 +482,6 @@ def run_grpo_microbatch(
 
 def train(params: Parameters, wandb_run) -> None:
     policy_model = AutoModelForCausalLM.from_pretrained(params.model_name, device_map="cuda", dtype=params.dtype)
-    reference_model = AutoModelForCausalLM.from_pretrained(
-        params.model_name, device_map="cpu", dtype=params.dtype
-    ).eval()
     tokenizer = AutoTokenizer.from_pretrained(params.model_name)
 
     if tokenizer.pad_token is None:
@@ -400,10 +501,16 @@ def train(params: Parameters, wandb_run) -> None:
     )
     base_env = GuessTheNumberEnv(env_config)
 
-    optimizer = torch.optim.AdamW(policy_model.parameters(), params.max_learning_rate)
-    wsd_scheduler = create_wsd_scheduler(
-        optimizer, params.num_iterations * params.num_steps * params.num_grpo_iterations, params
-    )
+    if params.num_iterations > 0:
+        reference_model = AutoModelForCausalLM.from_pretrained(
+            params.model_name, device_map="cpu", dtype=params.dtype
+        ).eval()
+        optimizer = torch.optim.AdamW(policy_model.parameters(), params.max_learning_rate)
+        wsd_scheduler = create_wsd_scheduler(
+            optimizer, params.num_iterations * params.num_steps * params.num_grpo_iterations, params
+        )
+    elif params.run_test_set:
+        print("Skipping training (num_iterations == 0), running test set eval only")
 
     for iteration in range(params.num_iterations):
         if iteration > 0:
@@ -510,3 +617,6 @@ def train(params: Parameters, wandb_run) -> None:
                     tree.add(f"[cyan]{k}[/cyan]: {formatted_val}")
 
                 console.print(tree)
+
+    if params.run_test_set:
+        wandb_run.log(evaluate_test_set(base_env, policy_model, tokenizer, params, wandb_run))

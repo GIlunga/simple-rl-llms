@@ -1124,6 +1124,7 @@ dependencies = [
     { name = "flash-linear-attention", extra = ["cuda"] },
     { name = "modal" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "transformers" },
     { name = "wandb" },
 ]
@@ -1144,6 +1145,7 @@ requires-dist = [
     { name = "flash-linear-attention", extras = ["cuda"], specifier = ">=0.5,<0.6" },
     { name = "modal", specifier = ">=1.4.2" },
     { name = "torch", specifier = "==2.14.1", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "tqdm", specifier = ">=4.69.0" },
     { name = "transformers", specifier = ">=5,<6" },
     { name = "wandb", specifier = "==0.28.1" },
 ]
