@@ -3,4 +3,5 @@
 - [x] Add metrics to understand direction mistakes
 - [x] Add parameter to disable dense rewards
 - [x] Add test set (fixed numbers)
+- [x] Improve wandb charts
 - [ ] Make rollouts parallel

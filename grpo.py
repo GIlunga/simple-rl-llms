@@ -17,7 +17,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from env import EnvConfig, GuessTheNumberEnv, RolloutMetrics, compute_env_metrics
+from env import EnvConfig, GuessTheNumberEnv, RolloutMetrics, compute_env_metrics, compute_quality_metrics
 
 if TYPE_CHECKING:
     from train import Parameters
@@ -266,7 +266,7 @@ def evaluate_test_set(
     tokenizer: AutoTokenizer,
     params: Parameters,
     wandb_run,
-) -> dict[str, float]:
+) -> dict[str, float | int]:
     budgets = sorted(params.reward_breakdown_turns)
     max_k = max(params.eval_pass_at_k)
     if max_k > params.eval_num_rollouts:
@@ -303,38 +303,35 @@ def evaluate_test_set(
             for k in params.eval_pass_at_k:
                 pass_k_rows.append([target, budget, k, pass_at_k(num_samples, num_correct, k)])
 
-    # One pass@K chart per budget (a line per target)
+    # pass@K chart: mean over targets, one line per budget
+    mean_pass_k_rows: list[list[float | int]] = []
     for budget in budgets:
-        rows = [[row[2], row[0], row[3]] for row in pass_k_rows if row[1] == budget]
-        pass_k_table = wandb.Table(columns=["k", "target", "pass@k"], data=rows)
-        wandb_run.log(
-            {
-                f"Eval/pass@k@{budget}": wandb.plot.line(
-                    pass_k_table, "k", "pass@k", stroke="target", title=f"pass@K @ {budget} turns"
-                ),
-                f"Eval/pass@k@{budget}/table": pass_k_table,
-            }
-        )
+        for k in params.eval_pass_at_k:
+            pass_ks = [row[3] for row in pass_k_rows if row[1] == budget and row[2] == k]
+            mean_pass_k_rows.append([k, budget, sum(pass_ks) / len(pass_ks)])
+    pass_k_table = wandb.Table(columns=["k", "budget", "mean pass@k"], data=mean_pass_k_rows)
+    wandb_run.log(
+        {
+            "Eval/pass@k": wandb.plot.line(
+                pass_k_table, "k", "mean pass@k", stroke="budget", title="pass@K (mean over numbers)"
+            )
+        }
+    )
 
-    # One accuracy chart (a line per budget)
+    # Accuracy chart: per target, one line per budget
     accuracy_table = wandb.Table(columns=["target", "budget", "accuracy"], data=accuracy_rows)
     wandb_run.log(
         {
             "Eval/accuracy": wandb.plot.line(
                 accuracy_table, "target", "accuracy", stroke="budget", title="Accuracy per number"
-            ),
-            "Eval/accuracy/table": accuracy_table,
+            )
         }
     )
 
-    # Aggregate scalars (mean over targets)
-    metrics: dict[str, float] = {}
-    for budget in budgets:
-        accuracies = [row[2] for row in accuracy_rows if row[1] == budget]
-        metrics[f"Eval/accuracy@{budget}"] = sum(accuracies) / len(accuracies)
-        for k in params.eval_pass_at_k:
-            pass_ks = [row[3] for row in pass_k_rows if row[1] == budget and row[2] == k]
-            metrics[f"Eval/pass@{k}@{budget}"] = sum(pass_ks) / len(pass_ks)
+    # Aggregate scalars
+    all_metrics = [m for metrics_lst in per_target_metrics.values() for m in metrics_lst]
+    metrics: dict[str, float | int] = compute_quality_metrics(all_metrics, prefix="Eval/")
+    metrics["Eval/Turns/avg"] = sum(m.turn_count for m in all_metrics) / len(all_metrics)
 
     # Print summary
     summary_table = Table(title="Test set accuracy per target")

@@ -42,20 +42,20 @@ class Parameters:
     # Env settings
     min_number: int = 1
     max_number: int = 10
-    max_turns: int = 6
+    max_turns: int = 5
     max_tokens_per_turn: int = 64
 
     # Reward settings
     reward_type: str = "binary"
     format_error_reward: float = 0.0
     invalid_action_reward: float = 0.0
-    reward_breakdown_turns: tuple[int, ...] = (4, 5, 6)
+    reward_breakdown_turns: tuple[int, ...] = (3, 4, 5)
 
     # Test set / eval settings
     run_test_set: bool = True
-    eval_numbers: tuple[int, ...] = (1, 5, 10)
-    eval_num_rollouts: int = 8
-    eval_pass_at_k: tuple[int, ...] = (1, 2, 4, 8)
+    eval_numbers: tuple[int, ...] = tuple(range(1, 11))
+    eval_num_rollouts: int = 16
+    eval_pass_at_k: tuple[int, ...] = (1, 2, 4, 8, 16)
 
 
 params = Parameters()

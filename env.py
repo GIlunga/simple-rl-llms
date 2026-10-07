@@ -210,18 +210,23 @@ class GuessTheNumberEnv:
         )
 
 
+def compute_quality_metrics(metrics: list[RolloutMetrics], prefix: str = "") -> dict[str, float | int]:
+    return {
+        f"{prefix}Quality/out of range turn count": sum(m.out_of_range_count for m in metrics),
+        f"{prefix}Quality/repeated turn count": sum(m.repeated_count for m in metrics),
+        f"{prefix}Quality/wrong direction rate": sum(m.wrong_direction_count for m in metrics)
+        / max(sum(m.direction_events for m in metrics), 1),
+    }
+
+
 def compute_env_metrics(
     metrics: list[RolloutMetrics],
     num_completions_per_prompt: int,
+    prefix: str = "",
 ) -> dict[str, float | int]:
     total_size = len(metrics)
 
-    out: dict[str, float | int] = {
-        "Quality/out of range turn count": sum(m.out_of_range_count for m in metrics),
-        "Quality/repeated turn count": sum(m.repeated_count for m in metrics),
-        "Quality/wrong direction rate": sum(m.wrong_direction_count for m in metrics)
-        / max(sum(m.direction_events for m in metrics), 1),
-    }
+    out: dict[str, float | int] = compute_quality_metrics(metrics, prefix)
 
     # Reward metrics for every turn budget
     budgets = sorted({budget for m in metrics for budget in m.reward_by_max_turns})
@@ -237,13 +242,15 @@ def compute_env_metrics(
         ]
 
         out |= {
-            f"Rewards@{budget}/avg": mean,
-            f"Rewards@{budget}/std": variance**0.5,
-            f"Rewards@{budget}/zero rate": sum(1 for r in budget_rewards if r <= 0) / total_size,
-            f"Rewards@{budget}/one rate": sum(1 for r in budget_rewards if r == 1) / total_size,
-            f"Rewards@{budget}/zero group rate": sum(1 for g in groups if all(r <= 0 for r in g)) / num_groups,
-            f"Rewards@{budget}/one group rate": sum(1 for g in groups if all(r == 1 for r in g)) / num_groups,
-            f"Rewards@{budget}/passing group rate": sum(1 for g in groups if any(r == 1 for r in g)) / num_groups,
+            f"{prefix}Rewards@{budget}/avg": mean,
+            f"{prefix}Rewards@{budget}/std": variance**0.5,
+            f"{prefix}Rewards@{budget}/zero rate": sum(1 for r in budget_rewards if r <= 0) / total_size,
+            f"{prefix}Rewards@{budget}/one rate": sum(1 for r in budget_rewards if r == 1) / total_size,
+            f"{prefix}Rewards@{budget}/zero group rate": sum(1 for g in groups if all(r <= 0 for r in g))
+            / num_groups,
+            f"{prefix}Rewards@{budget}/one group rate": sum(1 for g in groups if all(r == 1 for r in g)) / num_groups,
+            f"{prefix}Rewards@{budget}/passing group rate": sum(1 for g in groups if any(r == 1 for r in g))
+            / num_groups,
         }
 
     return out
