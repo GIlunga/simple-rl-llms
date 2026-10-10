@@ -38,6 +38,10 @@ explicit = true
 torch = { index = "pytorch" }
 causal-conv1d = { index = "astral" }
 
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"

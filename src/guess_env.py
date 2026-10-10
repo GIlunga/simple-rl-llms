@@ -1,19 +1,9 @@
+import copy
 import random
 import re
 from dataclasses import dataclass
 
 BOXED_GUESS_PATTERN = re.compile(r"\\boxed\{(-?\d+)\}")
-
-
-@dataclass(frozen=True)
-class EnvConfig:
-    min_number: int
-    max_number: int
-    max_turns: int
-    reward_type: str
-    format_error_reward: float
-    invalid_action_reward: float
-    reward_breakdown_turns: tuple[int, ...]
 
 
 @dataclass
@@ -26,7 +16,6 @@ class StepResult:
 
 @dataclass
 class RolloutMetrics:
-    reward: float
     won: bool
     turn_count: int
     out_of_range_count: int
@@ -37,20 +26,30 @@ class RolloutMetrics:
 
 
 class GuessTheNumberEnv:
-    def __init__(self, config: EnvConfig) -> None:
-        self.config = config
+    initial_message = "Enter your first guess to start the game!"
+
+    def __init__(
+        self,
+        min_number: int,
+        max_number: int,
+        max_turns: int,
+        reward_type: str,
+        format_error_reward: float,
+        invalid_action_reward: float,
+        reward_breakdown_turns: tuple[int, ...],
+    ) -> None:
+        self.min_number = min_number
+        self.max_number = max_number
+        self.max_turns = max_turns
+        self.reward_type = reward_type
+        self.format_error_reward = format_error_reward
+        self.invalid_action_reward = invalid_action_reward
+        self.reward_breakdown_turns = reward_breakdown_turns
+
         self.target: int | None = None
         self.turn_count: int = 0
         self.previous_guesses: set[int] = set()
         self.guesses: list[int | None] = []
-
-    @property
-    def min_number(self) -> int:
-        return self.config.min_number
-
-    @property
-    def max_number(self) -> int:
-        return self.config.max_number
 
     @property
     def system_prompt(self) -> str:
@@ -62,10 +61,6 @@ class GuessTheNumberEnv:
             "for example, \\boxed{1}. Follow that exact format for your final answer."
         )
 
-    @property
-    def initial_message(self) -> str:
-        return "Enter your first guess to start the game!"
-
     def reset(self, target: int | None = None) -> str:
         self.target = target if target is not None else random.randint(self.min_number, self.max_number)
         self.turn_count = 0
@@ -74,13 +69,16 @@ class GuessTheNumberEnv:
         return self.initial_message
 
     def clone(self) -> "GuessTheNumberEnv":
-        """Copy the current state (target included) so rollouts share a target."""
-        new = GuessTheNumberEnv(self.config)
-        new.target = self.target
-        new.turn_count = self.turn_count
+        new = copy.copy(self)
         new.previous_guesses = set(self.previous_guesses)
         new.guesses = list(self.guesses)
         return new
+
+    def _record(self, guess: int | None) -> None:
+        """Append a guess to the history and remember valid guesses for repeat detection."""
+        self.guesses.append(guess)
+        if guess is not None and self.min_number <= guess <= self.max_number:
+            self.previous_guesses.add(guess)
 
     def step(self, action: str) -> StepResult:
         if self.target is None:
@@ -91,33 +89,37 @@ class GuessTheNumberEnv:
         guess = int(matches[-1]) if matches else None
 
         if guess is None:
-            self.guesses.append(None)
+            self._record(None)
             obs = f"At turn {self.turn_count}, you did not provide a valid guess."
-            return StepResult(obs, terminated=True, truncated=self.turn_count == self.config.max_turns, guess=None)
+            return StepResult(obs, terminated=True, truncated=self.turn_count == self.max_turns, guess=None)
 
         if guess < self.min_number or guess > self.max_number:
-            self.guesses.append(guess)
+            self._record(guess)
             obs = f"At turn {self.turn_count}, you guessed {guess}, which is outside the range specified."
         elif guess in self.previous_guesses:
-            self.guesses.append(guess)
+            self._record(guess)
             obs = f"At turn {self.turn_count}, you guessed {guess}, which has been already guessed before."
+        elif guess == self.target:
+            self._record(guess)
+            obs = f"Congratulations! You guessed the correct number {self.target} in {self.turn_count} turns."
+            return StepResult(obs, terminated=True, truncated=False, guess=guess)
         else:
-            self.previous_guesses.add(guess)
-            self.guesses.append(guess)
-            if guess == self.target:
-                obs = f"Congratulations! You guessed the correct number {self.target} in {self.turn_count} turns."
-                return StepResult(obs, terminated=True, truncated=False, guess=guess)
+            self._record(guess)
             hint = "lower" if guess > self.target else "higher"
             obs = f"At turn {self.turn_count}, you guessed {guess}, and the target number is {hint} than {guess}."
 
-        if self.turn_count >= self.config.max_turns:
-            obs = "You have reached the maximum number of turns."
-            return StepResult(obs, terminated=True, truncated=True, guess=guess)
+        if self.turn_count >= self.max_turns:
+            return StepResult(
+                "You have reached the maximum number of turns.",
+                terminated=True,
+                truncated=True,
+                guess=guess,
+            )
         return StepResult(obs, terminated=False, truncated=False, guess=guess)
 
-    def score(self, budgets: tuple[int, ...] | list[int]) -> dict[int, float]:
+    def _rewards_by_max_turns(self) -> dict[int, float]:
         """Reward for every turn budget, derived by truncating the recorded guesses."""
-        sorted_budgets = sorted(budgets)
+        sorted_budgets = sorted(self.reward_breakdown_turns)
         budget_set = set(sorted_budgets)
 
         results: dict[int, float] = {}
@@ -130,7 +132,7 @@ class GuessTheNumberEnv:
             if terminal_reward is None and turn <= len(self.guesses):
                 guess = self.guesses[turn - 1]
                 if guess is None:
-                    terminal_reward = self.config.format_error_reward
+                    terminal_reward = self.format_error_reward
                 elif guess < self.min_number or guess > self.max_number:
                     last_guess, last_guess_invalid = guess, True
                 elif guess in seen:
@@ -141,33 +143,36 @@ class GuessTheNumberEnv:
                     last_guess, last_guess_invalid = guess, False
                     seen.add(guess)
 
+            # A terminal reward ends the trajectory: every remaining budget inherits it.
+            if terminal_reward is not None:
+                for budget in sorted_budgets:
+                    results.setdefault(budget, terminal_reward)
+                return results
+
             if turn in budget_set:
-                results[turn] = (
-                    terminal_reward
-                    if terminal_reward is not None
-                    else self._truncation_reward(last_guess, last_guess_invalid)
-                )
+                results[turn] = self._truncation_reward(last_guess, last_guess_invalid)
 
         return results
 
     def _truncation_reward(self, last_guess: int | None, last_guess_invalid: bool) -> float:
         if last_guess is None:
-            return self.config.format_error_reward
+            return self.format_error_reward
 
         if last_guess_invalid:
-            return self.config.invalid_action_reward
+            return self.invalid_action_reward
 
-        if self.config.reward_type == "binary":
+        if self.reward_type == "binary":
             return 0.0
 
         # Dense case, give partial credit on the final guess
         return 1.0 - abs(last_guess - self.target) / (self.max_number - self.min_number)
 
-    def metrics(self, reward_budget: int) -> RolloutMetrics:
-        """Per-rollout count metrics and the training reward at ``reward_budget``."""
+    def rollout_metrics(self) -> RolloutMetrics:
+        """Per-rollout count metrics and rewards for every turn budget."""
+        reward_by_max_turns = self._rewards_by_max_turns()
+        max_budget = max(self.reward_breakdown_turns)
+
         guesses = [g for g in self.guesses if g is not None]
-        reward_by_max_turns = self.score(self.config.reward_breakdown_turns)
-        reward = reward_by_max_turns[reward_budget]
 
         out_of_range_count = 0
         direction_events = 0
@@ -199,8 +204,7 @@ class GuessTheNumberEnv:
         repeated_count = len(guesses) - len(set(guesses))
 
         return RolloutMetrics(
-            reward=reward,
-            won=reward == 1,
+            won=reward_by_max_turns[max_budget] == 1.0,
             turn_count=self.turn_count,
             out_of_range_count=out_of_range_count,
             repeated_count=repeated_count,
@@ -210,7 +214,7 @@ class GuessTheNumberEnv:
         )
 
 
-def compute_quality_metrics(metrics: list[RolloutMetrics], prefix: str = "") -> dict[str, float | int]:
+def aggregate_quality_metrics(metrics: list[RolloutMetrics], prefix: str = "") -> dict[str, float | int]:
     return {
         f"{prefix}Quality/out of range turn count": sum(m.out_of_range_count for m in metrics),
         f"{prefix}Quality/repeated turn count": sum(m.repeated_count for m in metrics),
@@ -219,14 +223,19 @@ def compute_quality_metrics(metrics: list[RolloutMetrics], prefix: str = "") -> 
     }
 
 
-def compute_env_metrics(
+def aggregate_env_metrics(
     metrics: list[RolloutMetrics],
     num_completions_per_prompt: int,
     prefix: str = "",
 ) -> dict[str, float | int]:
+    """Aggregate a batch of rollouts into reward and quality statistics.
+
+    ``metrics`` must be ordered so that each consecutive block of ``num_completions_per_prompt``
+    rollouts belongs to the same prompt (as produced by ``get_rollouts``).
+    """
     total_size = len(metrics)
 
-    out: dict[str, float | int] = compute_quality_metrics(metrics, prefix)
+    out: dict[str, float | int] = aggregate_quality_metrics(metrics, prefix)
 
     # Reward metrics for every turn budget
     budgets = sorted({budget for m in metrics for budget in m.reward_by_max_turns})

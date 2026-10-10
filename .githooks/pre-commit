@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run from the repository root, regardless of where the hook is invoked from.
+cd "$(git rev-parse --show-toplevel)"
+
+# Snapshot working-tree state so we can tell whether ruff changed anything.
+snapshot() {
+  { git diff; git status --porcelain=v1 -uall; } | git hash-object --stdin
+}
+
+before="$(snapshot)"
+
+echo "pre-commit: ruff (auto-fix)"
+ruff_status=0
+uv run ruff check --fix . || ruff_status=$?
+
+after="$(snapshot)"
+
+if [ "$before" != "$after" ]; then
+  echo
+  echo "pre-commit: ruff applied automatic fixes."
+  echo "Review them, stage them, and commit again:"
+  echo "  git diff"
+  echo "  git add <files>"
+  exit 1
+fi
+
+if [ "$ruff_status" -ne 0 ]; then
+  echo "pre-commit: ruff found issues it could not fix automatically."
+  exit "$ruff_status"
+fi
+
+echo "pre-commit: pytest"
+uv run pytest -q

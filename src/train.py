@@ -6,6 +6,7 @@ import wandb
 
 from build_helpers import MODEL_NAME, download_models
 from grpo import train
+from guess_env import GuessTheNumberEnv
 
 
 @dataclass(frozen=True)
@@ -66,16 +67,29 @@ image = (
     .apt_install("build-essential", "clang")
     .uv_sync()
     .run_function(download_models, secrets=[modal.Secret.from_name("huggingface-secret")])
-    .add_local_python_source("env", "grpo")
+    .add_local_python_source("guess_env", "grpo")
 )
 app = modal.App("llm-rl-test", image=image)
 
 
 def run_local() -> None:
+    if params.max_turns not in params.reward_breakdown_turns:
+        raise ValueError("params.max_turns must be one of params.reward_breakdown_turns")
+
+    base_env = GuessTheNumberEnv(
+        min_number=params.min_number,
+        max_number=params.max_number,
+        max_turns=max(params.reward_breakdown_turns),
+        reward_type=params.reward_type,
+        format_error_reward=params.format_error_reward,
+        invalid_action_reward=params.invalid_action_reward,
+        reward_breakdown_turns=params.reward_breakdown_turns,
+    )
+
     wandb_run = wandb.init(project=params.wandb_project, name=params.wandb_run_name, config=asdict(params))
 
     try:
-        train(params, wandb_run)
+        train(params, base_env, wandb_run)
     finally:
         wandb.finish()
 

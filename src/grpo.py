@@ -17,7 +17,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from env import EnvConfig, GuessTheNumberEnv, RolloutMetrics, compute_env_metrics, compute_quality_metrics
+from guess_env import GuessTheNumberEnv, RolloutMetrics, aggregate_env_metrics, aggregate_quality_metrics
 
 if TYPE_CHECKING:
     from train import Parameters
@@ -175,8 +175,6 @@ def get_rollouts(
     advantage_lst = []
     metrics_lst: list[RolloutMetrics] = []
 
-    budgets = list(params.reward_breakdown_turns)
-
     for _ in range(num_prompts_per_step):
         base_env.reset()
         env_copies = [base_env.clone() for _ in range(num_completions_per_prompt)]
@@ -187,15 +185,15 @@ def get_rollouts(
                 env, policy_model, tokenizer, max_tokens_per_turn, params
             )
 
-            # Compute rewards (all turn budgets from the same trajectory)
-            rewards_by_turn = env.score(budgets)
+            # Rewards are computed for every turn budget from the same trajectory
+            rollout_metrics = env.rollout_metrics()
             # Training reward uses the max training budget
-            reward = rewards_by_turn[params.max_turns]
+            reward = rollout_metrics.reward_by_max_turns[params.max_turns]
 
             token_seq_lst.append(token_seq.squeeze())
             output_mask_lst.append(output_mask)
             group_rewards.append(reward)
-            metrics_lst.append(env.metrics(params.max_turns))
+            metrics_lst.append(rollout_metrics)
 
         group_rewards = torch.tensor(group_rewards)
 
@@ -222,7 +220,7 @@ def get_rollouts(
     # Compute dataset metrics
     all_rewards = torch.cat(reward_lst)
     rollout_lens = loss_mask[:, 1:].sum(dim=1)
-    dataset_metrics = compute_env_metrics(metrics_lst, num_completions_per_prompt) | {
+    dataset_metrics = aggregate_env_metrics(metrics_lst, num_completions_per_prompt) | {
         "Rollout Len/avg": rollout_lens.mean().item(),
         "Rollout Len/max": rollout_lens.max().item(),
         "Rollout Len/min": rollout_lens.min().item(),
@@ -285,7 +283,7 @@ def evaluate_test_set(
             metrics_lst: list[RolloutMetrics] = []
             for env in env_copies:
                 generate_single_rollout(env, policy_model, tokenizer, params.max_tokens_per_turn, params)
-                metrics_lst.append(env.metrics(params.max_turns))
+                metrics_lst.append(env.rollout_metrics())
                 num_won = sum(1 for m in metrics_lst if m.won)
                 progress.update(1)
                 progress.set_postfix(target=target, won=f"{num_won}/{len(metrics_lst)}")
@@ -330,7 +328,7 @@ def evaluate_test_set(
 
     # Aggregate scalars
     all_metrics = [m for metrics_lst in per_target_metrics.values() for m in metrics_lst]
-    metrics: dict[str, float | int] = compute_quality_metrics(all_metrics, prefix="Eval/")
+    metrics: dict[str, float | int] = aggregate_quality_metrics(all_metrics, prefix="Eval/")
     metrics["Eval/Turns/avg"] = sum(m.turn_count for m in all_metrics) / len(all_metrics)
 
     # Print summary
@@ -477,26 +475,12 @@ def run_grpo_microbatch(
     return loss, kl_per_token.sum().item()
 
 
-def train(params: Parameters, wandb_run) -> None:
+def train(params: Parameters, base_env: GuessTheNumberEnv, wandb_run) -> None:
     policy_model = AutoModelForCausalLM.from_pretrained(params.model_name, device_map="cuda", dtype=params.dtype)
     tokenizer = AutoTokenizer.from_pretrained(params.model_name)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.convert_tokens_to_ids("<|endoftext|>")
-
-    if params.max_turns not in params.reward_breakdown_turns:
-        raise ValueError("params.max_turns must be one of params.reward_breakdown_turns")
-
-    env_config = EnvConfig(
-        min_number=params.min_number,
-        max_number=params.max_number,
-        max_turns=max(params.reward_breakdown_turns),
-        reward_type=params.reward_type,
-        format_error_reward=params.format_error_reward,
-        invalid_action_reward=params.invalid_action_reward,
-        reward_breakdown_turns=params.reward_breakdown_turns,
-    )
-    base_env = GuessTheNumberEnv(env_config)
 
     if params.num_iterations > 0:
         reference_model = AutoModelForCausalLM.from_pretrained(
