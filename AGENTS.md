@@ -23,7 +23,7 @@ GRPO training for a small LLM on the "guess the number" game, run on Modal GPUs.
 - Sources live in a flat `src/` (no package). `modal run src/train.py` and `python src/train.py` both put the script's directory on `sys.path`, so `add_local_python_source` still resolves `guess_env`/`grpo` by name and intra-project imports stay top-level (`from guess_env import ...`).
 
 ## Key implementation details
-- Rollout generation is sequential per prompt: `num_prompts_per_step` fresh envs, `num_outputs_per_prompt` copies of one env (copies share the same target number — `base_env.clone()`).
+- Rollout generation is sequential per prompt: `num_prompts_per_step` fresh envs, `num_outputs_per_prompt` copies of one env sharing the same target number (`base_env.spawn(...)`, which resets then copies; clones are only ever made from a fresh env).
 - `src/guess_env.py` owns the game: `step` parses the last `\boxed{<int>}` per turn, returns a `StepResult` (observation/termination), and treats out-of-range and repeated guesses as invalid actions (no termination, but `invalid_action_reward` when they decide a truncated budget).
 - Rewards are computed from the recorded trajectory by `env.rollout_metrics()` (not read from observations). `reward_type` selects `binary` (solved within the turn budget) or `dense` (distance partial credit); format errors reward `format_error_reward` (0.0) and terminate.
 - Rewards are scored for multiple turn budgets (`reward_breakdown_turns`), all from the same trajectory, and logged as `Rewards@{budget}/*`. Training uses `params.max_turns`.

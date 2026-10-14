@@ -17,7 +17,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from guess_env import GuessTheNumberEnv, RolloutMetrics, aggregate_env_metrics, aggregate_quality_metrics
+from guess_env import EnvConfig, GuessTheNumberEnv, RolloutMetrics, aggregate_env_metrics, aggregate_quality_metrics
 
 if TYPE_CHECKING:
     from train import Parameters
@@ -159,7 +159,7 @@ def generate_single_rollout(
 
 
 def get_rollouts(
-    base_env: GuessTheNumberEnv,
+    env_config: EnvConfig,
     policy_model: AutoModelForCausalLM,
     reference_model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -176,8 +176,7 @@ def get_rollouts(
     metrics_lst: list[RolloutMetrics] = []
 
     for _ in range(num_prompts_per_step):
-        base_env.reset()
-        env_copies = [base_env.clone() for _ in range(num_completions_per_prompt)]
+        env_copies = GuessTheNumberEnv.spawn(env_config, num_completions_per_prompt)
         group_rewards = []
 
         for env in env_copies:
@@ -259,7 +258,7 @@ def pass_at_k(num_samples: int, num_correct: int, k: int) -> float:
 
 
 def evaluate_test_set(
-    base_env: GuessTheNumberEnv,
+    env_config: EnvConfig,
     policy_model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     params: Parameters,
@@ -268,9 +267,7 @@ def evaluate_test_set(
     budgets = sorted(params.reward_breakdown_turns)
     max_k = max(params.eval_pass_at_k)
     if max_k > params.eval_num_rollouts:
-        raise ValueError(
-            f"eval_pass_at_k max ({max_k}) cannot exceed eval_num_rollouts ({params.eval_num_rollouts})"
-        )
+        raise ValueError(f"eval_pass_at_k max ({max_k}) cannot exceed eval_num_rollouts ({params.eval_num_rollouts})")
 
     policy_model.eval()
 
@@ -278,8 +275,7 @@ def evaluate_test_set(
     total_rollouts = len(params.eval_numbers) * params.eval_num_rollouts
     with tqdm(total=total_rollouts, desc="Test set rollouts") as progress:
         for target in params.eval_numbers:
-            base_env.reset(target=target)
-            env_copies = [base_env.clone() for _ in range(params.eval_num_rollouts)]
+            env_copies = GuessTheNumberEnv.spawn(env_config, params.eval_num_rollouts, target=target)
             metrics_lst: list[RolloutMetrics] = []
             for env in env_copies:
                 generate_single_rollout(env, policy_model, tokenizer, params.max_tokens_per_turn, params)
@@ -475,7 +471,7 @@ def run_grpo_microbatch(
     return loss, kl_per_token.sum().item()
 
 
-def train(params: Parameters, base_env: GuessTheNumberEnv, wandb_run) -> None:
+def train(params: Parameters, env_config: EnvConfig, wandb_run) -> None:
     policy_model = AutoModelForCausalLM.from_pretrained(params.model_name, device_map="cuda", dtype=params.dtype)
     tokenizer = AutoTokenizer.from_pretrained(params.model_name)
 
@@ -509,7 +505,7 @@ def train(params: Parameters, base_env: GuessTheNumberEnv, wandb_run) -> None:
                 old_policy_logprobs,
                 ref_model_logprobs,
             ) = get_rollouts(
-                base_env,
+                env_config,
                 policy_model,
                 reference_model,
                 tokenizer,
@@ -600,4 +596,4 @@ def train(params: Parameters, base_env: GuessTheNumberEnv, wandb_run) -> None:
                 console.print(tree)
 
     if params.run_test_set:
-        wandb_run.log(evaluate_test_set(base_env, policy_model, tokenizer, params, wandb_run))
+        wandb_run.log(evaluate_test_set(env_config, policy_model, tokenizer, params, wandb_run))

@@ -1,6 +1,6 @@
 import pytest
 
-from guess_env import GuessTheNumberEnv
+from guess_env import EnvConfig, GuessTheNumberEnv
 
 BASE = dict(
     min_number=1,
@@ -82,8 +82,7 @@ FORMAT = {1: -2.0, 2: -2.0, 3: -2.0, 4: -2.0}
 def test_env_failure_cases(
     reward_type, target, actions, expected_rewards, expected_won, expected_out_of_range, expected_repeated
 ):
-    env = GuessTheNumberEnv(reward_type=reward_type, **BASE)
-    env.reset(target=target)
+    env = GuessTheNumberEnv(EnvConfig(reward_type=reward_type, **BASE), target=target)
     for action in actions:
         result = env.step(action)
         if result.terminated or result.truncated:

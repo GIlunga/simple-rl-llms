@@ -6,7 +6,7 @@ import wandb
 
 from build_helpers import MODEL_NAME, download_models
 from grpo import train
-from guess_env import GuessTheNumberEnv
+from guess_env import EnvConfig
 
 
 @dataclass(frozen=True)
@@ -76,7 +76,7 @@ def run_local() -> None:
     if params.max_turns not in params.reward_breakdown_turns:
         raise ValueError("params.max_turns must be one of params.reward_breakdown_turns")
 
-    base_env = GuessTheNumberEnv(
+    env_config = EnvConfig(
         min_number=params.min_number,
         max_number=params.max_number,
         max_turns=max(params.reward_breakdown_turns),
@@ -89,7 +89,7 @@ def run_local() -> None:
     wandb_run = wandb.init(project=params.wandb_project, name=params.wandb_run_name, config=asdict(params))
 
     try:
-        train(params, base_env, wandb_run)
+        train(params, env_config, wandb_run)
     finally:
         wandb.finish()
 
