@@ -5,3 +5,4 @@
 - [x] Add test set (fixed numbers)
 - [x] Improve wandb charts
 - [ ] Make rollouts parallel
+- [ ] LoRA?

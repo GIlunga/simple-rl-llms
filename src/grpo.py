@@ -18,6 +18,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from guess_env import EnvConfig, GuessTheNumberEnv, RolloutMetrics, aggregate_env_metrics, aggregate_quality_metrics
+from vllm_rollout import VLLMRolloutEngine
 
 if TYPE_CHECKING:
     from train import Parameters
@@ -163,44 +164,47 @@ def get_rollouts(
     policy_model: AutoModelForCausalLM,
     reference_model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
+    engine: VLLMRolloutEngine | None,
     max_tokens_per_turn: int,
     num_prompts_per_step: int,
     num_completions_per_prompt: int,
     params: Parameters,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float | int], torch.Tensor, torch.Tensor]:
-    """Simple sequential multiple rollout generation for multiple prompts. No batching"""
-    token_seq_lst = []
-    output_mask_lst = []
-    reward_lst = []
-    advantage_lst = []
-    metrics_lst: list[RolloutMetrics] = []
+    """Batched vLLM generation when an engine is given, else sequential HF generation."""
+    envs = [
+        env
+        for _ in range(num_prompts_per_step)
+        for env in GuessTheNumberEnv.spawn(env_config, num_completions_per_prompt)
+    ]
 
-    for _ in range(num_prompts_per_step):
-        env_copies = GuessTheNumberEnv.spawn(env_config, num_completions_per_prompt)
-        group_rewards = []
-
-        for env in env_copies:
+    if engine is not None:
+        token_seq_lst, output_mask_lst, metrics_lst = engine.generate_for_envs(envs, params)
+    else:
+        token_seq_lst = []
+        output_mask_lst = []
+        metrics_lst = []
+        for env in envs:
             token_seq, output_mask, _ = generate_single_rollout(
                 env, policy_model, tokenizer, max_tokens_per_turn, params
             )
-
-            # Rewards are computed for every turn budget from the same trajectory
-            rollout_metrics = env.rollout_metrics()
-            # Training reward uses the max training budget
-            reward = rollout_metrics.reward_by_max_turns[params.max_turns]
-
             token_seq_lst.append(token_seq.squeeze())
             output_mask_lst.append(output_mask)
-            group_rewards.append(reward)
-            metrics_lst.append(rollout_metrics)
+            metrics_lst.append(env.rollout_metrics())
 
-        group_rewards = torch.tensor(group_rewards)
-
-        # GRPO advantage normalization
-        advantages = (group_rewards - group_rewards.mean()) / (group_rewards.std() + 1e-8)
-
+    # GRPO advantage normalization, one group per prompt.
+    # Rewards are computed for every turn budget from the same trajectory; training uses params.max_turns.
+    reward_lst = []
+    advantage_lst = []
+    for prompt_idx in range(num_prompts_per_step):
+        start = prompt_idx * num_completions_per_prompt
+        group_rewards = torch.tensor(
+            [
+                metrics_lst[i].reward_by_max_turns[params.max_turns]
+                for i in range(start, start + num_completions_per_prompt)
+            ]
+        )
+        advantage_lst.append((group_rewards - group_rewards.mean()) / (group_rewards.std() + 1e-8))
         reward_lst.append(group_rewards)
-        advantage_lst.append(advantages)
 
     # shape: B x T
     token_seqs = torch.nn.utils.rnn.pad_sequence(token_seq_lst, batch_first=True, padding_value=tokenizer.pad_token_id)
@@ -261,6 +265,7 @@ def evaluate_test_set(
     env_config: EnvConfig,
     policy_model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
+    engine: VLLMRolloutEngine | None,
     params: Parameters,
     wandb_run,
 ) -> dict[str, float | int]:
@@ -276,14 +281,17 @@ def evaluate_test_set(
     with tqdm(total=total_rollouts, desc="Test set rollouts") as progress:
         for target in params.eval_numbers:
             env_copies = GuessTheNumberEnv.spawn(env_config, params.eval_num_rollouts, target=target)
-            metrics_lst: list[RolloutMetrics] = []
-            for env in env_copies:
-                generate_single_rollout(env, policy_model, tokenizer, params.max_tokens_per_turn, params)
-                metrics_lst.append(env.rollout_metrics())
-                num_won = sum(1 for m in metrics_lst if m.won)
-                progress.update(1)
-                progress.set_postfix(target=target, won=f"{num_won}/{len(metrics_lst)}")
+            if engine is not None:
+                _, _, metrics_lst = engine.generate_for_envs(env_copies, params)
+            else:
+                metrics_lst = []
+                for env in env_copies:
+                    generate_single_rollout(env, policy_model, tokenizer, params.max_tokens_per_turn, params)
+                    metrics_lst.append(env.rollout_metrics())
             per_target_metrics[target] = metrics_lst
+            num_won = sum(1 for m in metrics_lst if m.won)
+            progress.update(len(env_copies))
+            progress.set_postfix(target=target, won=f"{num_won}/{len(metrics_lst)}")
 
     # Per-target, per-budget accuracy and pass@K
     accuracy_rows: list[list[float | int]] = []
@@ -489,6 +497,13 @@ def train(params: Parameters, env_config: EnvConfig, wandb_run) -> None:
     elif params.run_test_set:
         print("Skipping training (num_iterations == 0), running test set eval only")
 
+    # Build the vLLM engine only after the HF models are loaded: importing vLLM affects how
+    # transformers resolves the multimodal Qwen config for any model built afterwards.
+    engine = None
+    if params.use_vllm:
+        engine = VLLMRolloutEngine(params.model_name, tokenizer, params)
+        engine.sync_weights(policy_model)
+
     for iteration in range(params.num_iterations):
         if iteration > 0:
             print("Syncing reference model")
@@ -509,6 +524,7 @@ def train(params: Parameters, env_config: EnvConfig, wandb_run) -> None:
                 policy_model,
                 reference_model,
                 tokenizer,
+                engine,
                 params.max_tokens_per_turn,
                 params.num_prompts_per_step,
                 params.num_outputs_per_prompt,
@@ -595,5 +611,9 @@ def train(params: Parameters, env_config: EnvConfig, wandb_run) -> None:
 
                 console.print(tree)
 
+            # Weights changed, push them into vLLM for the next step's rollouts
+            if engine is not None:
+                engine.sync_weights(policy_model)
+
     if params.run_test_set:
-        wandb_run.log(evaluate_test_set(env_config, policy_model, tokenizer, params, wandb_run))
+        wandb_run.log(evaluate_test_set(env_config, policy_model, tokenizer, engine, params, wandb_run))

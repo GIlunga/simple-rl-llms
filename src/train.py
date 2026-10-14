@@ -21,6 +21,16 @@ class Parameters:
     wandb_project: str = "SimpleGRPO"
     wandb_run_name: str = "GRPO no think"
 
+    # vLLM rollout settings (collocated with training on the same GPU)
+    use_vllm: bool = True
+    rollout_batch_size: int = 2
+    vllm_gpu_memory_utilization: float = 0.3
+    vllm_max_model_len: int = 2048
+    vllm_kv_cache_bytes: int | None = None
+    vllm_enforce_eager: bool = True
+    vllm_enable_prefix_caching: bool = True
+    vllm_seed: int = 0
+
     # GRPO settings
     num_iterations: int = 0
     num_steps: int = 2
@@ -67,7 +77,7 @@ image = (
     .apt_install("build-essential", "clang")
     .uv_sync()
     .run_function(download_models, secrets=[modal.Secret.from_name("huggingface-secret")])
-    .add_local_python_source("guess_env", "grpo")
+    .add_local_python_source("guess_env", "grpo", "vllm_rollout")
 )
 app = modal.App("llm-rl-test", image=image)
 

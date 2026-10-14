@@ -5,6 +5,7 @@ GRPO training for a small LLM on the "guess the number" game, run on Modal GPUs.
 ## Layout
 - `src/guess_env.py` — the guess-the-number environment (parsing, observations, termination) plus the integrated reward system and per-rollout metrics (`GuessTheNumberEnv.rollout_metrics`) and batch aggregation (`aggregate_env_metrics`, `aggregate_quality_metrics`). Env settings are passed directly to `GuessTheNumberEnv(...)`.
 - `src/grpo.py` — the trainer (env rollouts, GRPO objective, logging). All hyperparameters are passed in as a `Parameters` argument; no Modal/wandb-init code here.
+- `src/vllm_rollout.py` — `VLLMRolloutEngine`, the collocated vLLM rollout generator (batched multi-turn generation + in-process weight sync). The `match_weight_names` helper maps HF param names to vLLM ones.
 - `src/train.py` — the entrypoint. Holds the `Parameters` dataclass, constructs the `GuessTheNumberEnv`, the Modal image/app, and both the local and Modal run paths. Calls `grpo.train(params, base_env, wandb_run)`.
 - `src/build_helpers.py` — `MODEL_NAME` plus the `download_models` build helper used by the Modal image. Kept out of `train.py` so the image build step doesn't import the training code (see below).
 - `tests/test_env.py` — pytest suite for the environment (pytest `pythonpath = ["src"]`, `testpaths = ["tests"]`).
@@ -17,13 +18,17 @@ GRPO training for a small LLM on the "guess the number" game, run on Modal GPUs.
 - Local dev: `uv sync` / `uv run`; test with `uv run pytest`; lint with ruff (line-length 120). A `pre-commit` hook in `.githooks/` runs ruff (auto-fixes then aborts if it changed files so you can review/re-stage) + pytest (enable once with `git config core.hooksPath .githooks`).
 
 ## Modal image / imports
-- The image is built as `...uv_sync().run_function(download_models, ...).add_local_python_source("guess_env", "grpo")`. The local-source mounts must come **last** (Modal forbids build steps after `add_local_*` unless `copy=True`).
+- The image is built as `...uv_sync().run_function(download_models, ...).add_local_python_source("guess_env", "grpo", "vllm_rollout")`. The local-source mounts must come **last** (Modal forbids build steps after `add_local_*` unless `copy=True`).
 - `download_models` lives in `build_helpers.py` so the `run_function` build step imports only that module. If it lived in `train.py`, the build would import `train.py` and thus `grpo`/`guess_env` before they are mounted — the original `ModuleNotFoundError: No module named 'guess_env'`.
-- `guess_env` and `grpo` must be listed in `add_local_python_source`: the entrypoint is run as a single file, so Modal only auto-mounts `src/train.py`, not sibling modules.
+- `guess_env`, `grpo` and `vllm_rollout` must be listed in `add_local_python_source`: the entrypoint is run as a single file, so Modal only auto-mounts `src/train.py`, not sibling modules.
 - Sources live in a flat `src/` (no package). `modal run src/train.py` and `python src/train.py` both put the script's directory on `sys.path`, so `add_local_python_source` still resolves `guess_env`/`grpo` by name and intra-project imports stay top-level (`from guess_env import ...`).
 
 ## Key implementation details
-- Rollout generation is sequential per prompt: `num_prompts_per_step` fresh envs, `num_outputs_per_prompt` copies of one env sharing the same target number (`base_env.spawn(...)`, which resets then copies; clones are only ever made from a fresh env).
+- Rollout generation uses vLLM (`VLLMRolloutEngine`) by default: the engine core runs **in-process** (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) on the same GPU as training. Each turn calls `llm.generate` once for all still-running envs; the full conversation is resubmitted each turn as a `TokensPrompt` with prefix caching. `use_vllm=False` falls back to the sequential HF `generate_single_rollout`.
+- Rollouts are processed in chunks of `rollout_batch_size` to bound the number of concurrent sequences (and thus KV cache), which matters once thinking is enabled.
+- vLLM weights are synced from `policy_model` after each step via `llm.collective_rpc("reload_weights", ...)`, using `match_weight_names` to map HF names to vLLM's (the multimodal checkpoint nests the text model under `language_model.`). The IPC weight-transfer backend cannot be used because it fails in-process (`invalid device context`).
+- The vLLM engine must be built **after** the HF models are loaded: importing vLLM changes how transformers resolves the multimodal Qwen config, so loading the reference model afterwards fails.
+- vLLM generation includes the terminating `<|im_end|>` token in `token_ids` (unlike older versions), so the trajectory matches the HF path without re-appending the stop token.
 - `src/guess_env.py` owns the game: `step` parses the last `\boxed{<int>}` per turn, returns a `StepResult` (observation/termination), and treats out-of-range and repeated guesses as invalid actions (no termination, but `invalid_action_reward` when they decide a truncated budget).
 - Rewards are computed from the recorded trajectory by `env.rollout_metrics()` (not read from observations). `reward_type` selects `binary` (solved within the turn budget) or `dense` (distance partial credit); format errors reward `format_error_reward` (0.0) and terminate.
 - Rewards are scored for multiple turn budgets (`reward_breakdown_turns`), all from the same trajectory, and logged as `Rewards@{budget}/*`. Training uses `params.max_turns`.

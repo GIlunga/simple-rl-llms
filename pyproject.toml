@@ -6,11 +6,13 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "transformers>=5,<6",
-    "torch==2.14.1",
+    "torch==2.13.0",
     "accelerate>1,<2",
     "modal>=1.4.2",
-    "causal-conv1d==1.7.0+cu.13.0.torch.2.14",
+    "causal-conv1d==1.7.0+cu.13.0.torch.2.13",
+    "flash-attn==2.8.3.post1+cu.13.0.torch.2.13",
     "flash-linear-attention[cuda]>=0.5,<0.6",
+    "vllm==0.30.0",
     "wandb==0.28.1",
     "tqdm>=4.69.0",
 ]
@@ -37,6 +39,8 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch" }
 causal-conv1d = { index = "astral" }
+flash-attn = { index = "astral" }
+vllm = { index = "astral" }
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
