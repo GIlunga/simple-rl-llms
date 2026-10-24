@@ -5,7 +5,7 @@ GRPO training for a small LLM on the "guess the number" game, run on Modal GPUs.
 ## Layout
 - `src/guess_env.py` — the guess-the-number environment (parsing, observations, termination) plus the integrated reward system and per-rollout metrics (`GuessTheNumberEnv.rollout_metrics`) and batch aggregation (`aggregate_env_metrics`, `aggregate_quality_metrics`). Env settings are passed directly to `GuessTheNumberEnv(...)`.
 - `src/grpo.py` — the trainer (env rollouts, GRPO objective, logging). All hyperparameters are passed in as a `Parameters` argument; no Modal/wandb-init code here.
-- `src/vllm_rollout.py` — `VLLMRolloutEngine`, the collocated vLLM rollout generator (batched multi-turn generation + in-process weight sync). The `match_weight_names` helper maps HF param names to vLLM ones.
+- `src/vllm_rollout.py` — `VLLMRolloutEngine`, the collocated vLLM rollout generator (batched multi-turn generation + in-process weight sync). The `checkpoint_name` helper maps text-only HF parameter names to the vLLM conditional model's checkpoint layout.
 - `src/train.py` — the entrypoint. Holds the `Parameters` dataclass, constructs the `GuessTheNumberEnv`, the Modal image/app, and both the local and Modal run paths. Calls `grpo.train(params, base_env, wandb_run)`.
 - `src/build_helpers.py` — `MODEL_NAME` plus the `download_models` build helper used by the Modal image. Kept out of `train.py` so the image build step doesn't import the training code (see below).
 - `tests/test_env.py` — pytest suite for the environment (pytest `pythonpath = ["src"]`, `testpaths = ["tests"]`).
@@ -13,7 +13,7 @@ GRPO training for a small LLM on the "guess the number" game, run on Modal GPUs.
 - `pyproject.toml` — uv project; deps pinned (torch from cu126 index, modal, wandb).
 
 ## Running
-- `modal run src/train.py` — runs on Modal GPUs (first run is slow: Triton kernel compilation; kernels are cached in the `kernel-cache` volume at `/root/.triton`).
+- `modal run src/train.py` — runs on Modal GPUs (first run is slow: Triton kernel compilation; Triton kernels are cached in the `kernel-cache` volume at `/root/.triton`, and TileLang's cache is mounted at `/root/.tilelang/cache` — the first training step compiles one backward kernel (~35 s), later steps/runs reuse it).
 - `uv run src/train.py` (or `python src/train.py`) — runs locally via the `__main__` block.
 - Local dev: `uv sync` / `uv run`; test with `uv run pytest`; lint with ruff (line-length 120). A `pre-commit` hook in `.githooks/` runs ruff (auto-fixes then aborts if it changed files so you can review/re-stage) + pytest (enable once with `git config core.hooksPath .githooks`).
 
@@ -25,8 +25,10 @@ GRPO training for a small LLM on the "guess the number" game, run on Modal GPUs.
 
 ## Key implementation details
 - Rollout generation uses vLLM (`VLLMRolloutEngine`) by default: the engine core runs **in-process** (`VLLM_ENABLE_V1_MULTIPROCESSING=0`) on the same GPU as training. Each turn calls `llm.generate` once for all still-running envs; the full conversation is resubmitted each turn as a `TokensPrompt` with prefix caching. `use_vllm=False` falls back to the sequential HF `generate_single_rollout`.
-- Rollouts are processed in chunks of `rollout_batch_size` to bound the number of concurrent sequences (and thus KV cache), which matters once thinking is enabled.
-- vLLM weights are synced from `policy_model` after each step via `llm.collective_rpc("reload_weights", ...)`, using `match_weight_names` to map HF names to vLLM's (the multimodal checkpoint nests the text model under `language_model.`). The IPC weight-transfer backend cannot be used because it fails in-process (`invalid device context`).
+- Rollouts are processed in chunks: training uses `rollout_batch_size`, while eval uses `eval_rollout_batch_size` (`None` by default → all `targets × eval_num_rollouts` envs in one call, then metrics are regrouped by target). Chunking bounds concurrent sequences and KV cache.
+- vLLM weights are synced from `policy_model` after each step via `llm.collective_rpc("reload_weights", ...)`. Weights are sent in **checkpoint layout** (`checkpoint_name`: `model.*` → `model.language_model.*`), so vLLM's own HF→vLLM mapper and packed mappings fuse qkv/gate_up/GDN projections. Do not send vLLM parameter names: fused params have no 1:1 HF equivalent and would silently stay stale. The IPC weight-transfer backend cannot be used because it fails in-process (`invalid device context`).
+- The engine is built with `language_model_only=True` (`vllm_language_model_only`): the vision tower is replaced by a `StageMissingLayer`, so no vision weights are allocated, loaded, or synced. Only the text model is used by the game.
+- FlashInfer's top-k/top-p sampler is disabled (`VLLM_USE_FLASHINFER_SAMPLER=0`): its JIT compilation accounted for ~90 s of the engine's startup `profile_run`. The native sampler is equally fast at runtime for this workload (9 s eval, same pass rates).
 - The vLLM engine must be built **after** the HF models are loaded: importing vLLM changes how transformers resolves the multimodal Qwen config, so loading the reference model afterwards fails.
 - vLLM generation includes the terminating `<|im_end|>` token in `token_ids` (unlike older versions), so the trajectory matches the HF path without re-appending the stop token.
 - `src/guess_env.py` owns the game: `step` parses the last `\boxed{<int>}` per turn, returns a `StepResult` (observation/termination), and treats out-of-range and repeated guesses as invalid actions (no termination, but `invalid_action_reward` when they decide a truncated budget).

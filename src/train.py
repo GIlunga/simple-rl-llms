@@ -23,12 +23,15 @@ class Parameters:
 
     # vLLM rollout settings (collocated with training on the same GPU)
     use_vllm: bool = True
-    rollout_batch_size: int = 2
+    # Max concurrent sequences per generate call. At gpu_memory_utilization=0.3 the KV cache holds
+    # ~71 sequences of 2048 tokens, so 64 fits with margin; the current training/eval batch is 16.
+    rollout_batch_size: int = 64
     vllm_gpu_memory_utilization: float = 0.3
     vllm_max_model_len: int = 2048
     vllm_kv_cache_bytes: int | None = None
     vllm_enforce_eager: bool = True
     vllm_enable_prefix_caching: bool = True
+    vllm_language_model_only: bool = True
     vllm_seed: int = 0
 
     # GRPO settings
@@ -66,12 +69,15 @@ class Parameters:
     run_test_set: bool = True
     eval_numbers: tuple[int, ...] = tuple(range(1, 11))
     eval_num_rollouts: int = 16
+    # None = submit all (targets x rollouts) envs in one vLLM call; set an int to chunk.
+    eval_rollout_batch_size: int | None = None
     eval_pass_at_k: tuple[int, ...] = (1, 2, 4, 8, 16)
 
 
 params = Parameters()
 
 kernel_volume = modal.Volume.from_name("kernel-cache", create_if_missing=True)
+tilelang_cache_volume = modal.Volume.from_name("tilelang-cache", create_if_missing=True)
 image = (
     modal.Image.from_registry("nvidia/cuda:13.0.0-devel-ubuntu22.04", add_python="3.12")
     .apt_install("build-essential", "clang")
@@ -108,7 +114,10 @@ def run_local() -> None:
     gpu=params.gpu,
     timeout=params.timeout,
     secrets=[modal.Secret.from_name("huggingface-secret"), modal.Secret.from_name("wandb-secret")],
-    volumes={"/root/.triton": kernel_volume},
+    volumes={
+        "/root/.triton": kernel_volume,
+        "/root/.tilelang/cache": tilelang_cache_volume,
+    },
 )
 def train_remote() -> None:
     run_local()

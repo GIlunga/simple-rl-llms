@@ -178,7 +178,9 @@ def get_rollouts(
     ]
 
     if engine is not None:
-        token_seq_lst, output_mask_lst, metrics_lst = engine.generate_for_envs(envs, params)
+        token_seq_lst, output_mask_lst, metrics_lst = engine.generate_for_envs(
+            envs, params, max_concurrency=params.rollout_batch_size
+        )
     else:
         token_seq_lst = []
         output_mask_lst = []
@@ -261,6 +263,16 @@ def pass_at_k(num_samples: int, num_correct: int, k: int) -> float:
     return 1.0 - math.comb(num_samples - num_correct, k) / math.comb(num_samples, k)
 
 
+def group_metrics_by_target(
+    env_targets: list[int], metrics_lst: list[RolloutMetrics], targets: tuple[int, ...]
+) -> dict[int, list[RolloutMetrics]]:
+    """Regroup per-env metrics (in submission order) by their target."""
+    grouped: dict[int, list[RolloutMetrics]] = {target: [] for target in targets}
+    for target, metrics in zip(env_targets, metrics_lst, strict=True):
+        grouped[target].append(metrics)
+    return grouped
+
+
 def evaluate_test_set(
     env_config: EnvConfig,
     policy_model: AutoModelForCausalLM,
@@ -276,22 +288,30 @@ def evaluate_test_set(
 
     policy_model.eval()
 
-    per_target_metrics: dict[int, list[RolloutMetrics]] = {}
-    total_rollouts = len(params.eval_numbers) * params.eval_num_rollouts
+    # Flatten all targets so vLLM can batch every rollout in one call (metrics are regrouped below).
+    envs: list[GuessTheNumberEnv] = []
+    env_targets: list[int] = []
+    for target in params.eval_numbers:
+        target_envs = GuessTheNumberEnv.spawn(env_config, params.eval_num_rollouts, target=target)
+        envs.extend(target_envs)
+        env_targets.extend([target] * len(target_envs))
+
+    total_rollouts = len(envs)
     with tqdm(total=total_rollouts, desc="Test set rollouts") as progress:
-        for target in params.eval_numbers:
-            env_copies = GuessTheNumberEnv.spawn(env_config, params.eval_num_rollouts, target=target)
-            if engine is not None:
-                _, _, metrics_lst = engine.generate_for_envs(env_copies, params)
-            else:
-                metrics_lst = []
-                for env in env_copies:
-                    generate_single_rollout(env, policy_model, tokenizer, params.max_tokens_per_turn, params)
-                    metrics_lst.append(env.rollout_metrics())
-            per_target_metrics[target] = metrics_lst
-            num_won = sum(1 for m in metrics_lst if m.won)
-            progress.update(len(env_copies))
-            progress.set_postfix(target=target, won=f"{num_won}/{len(metrics_lst)}")
+        if engine is not None:
+            print(f"[eval] generating {total_rollouts} rollouts in one batch", flush=True)
+            _, _, metrics_lst = engine.generate_for_envs(envs, params, max_concurrency=params.eval_rollout_batch_size)
+            progress.update(total_rollouts)
+        else:
+            metrics_lst = []
+            for env in envs:
+                generate_single_rollout(env, policy_model, tokenizer, params.max_tokens_per_turn, params)
+                metrics_lst.append(env.rollout_metrics())
+                progress.update(1)
+        num_won = sum(1 for m in metrics_lst if m.won)
+        progress.set_postfix(won=f"{num_won}/{len(metrics_lst)}")
+
+    per_target_metrics = group_metrics_by_target(env_targets, metrics_lst, params.eval_numbers)
 
     # Per-target, per-budget accuracy and pass@K
     accuracy_rows: list[list[float | int]] = []

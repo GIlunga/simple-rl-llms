@@ -94,3 +94,10 @@ def test_env_failure_cases(
     assert metrics.won == expected_won
     assert metrics.out_of_range_count == expected_out_of_range
     assert metrics.repeated_count == expected_repeated
+
+
+def test_system_prompt_includes_format_instruction():
+    env = GuessTheNumberEnv(EnvConfig(reward_type="binary", **BASE), target=7)
+
+    assert "\\boxed{}" in env.system_prompt
+    assert "possible. When you enter" in env.system_prompt

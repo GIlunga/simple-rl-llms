@@ -16,26 +16,24 @@ if TYPE_CHECKING:
 # Run vLLM's engine core in this process (no separate worker), so generation and training
 # share one process and one GPU. Must be set before vLLM reads its env vars.
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+# FlashInfer's JIT-compiled top-k/top-p sampler dominates startup profiling for this model
+# (~90s of profile_run). The native sampler measured equally fast at runtime here, so disable it.
+os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
 _VLLM_DTYPE = {torch.bfloat16: "bfloat16", torch.float16: "half", torch.float32: "float"}
 
 
-def match_weight_names(vllm_names: list[str], hf_names: list[str]) -> dict[str, str]:
-    """Map each HF parameter name to the unique vLLM parameter whose name it suffixes.
+def checkpoint_name(hf_name: str) -> str:
+    """Convert a text-only HF parameter name to vLLM's checkpoint layout.
 
-    Multimodal checkpoints nest the text model differently in HF (``model.layers...``) and vLLM
-    (``language_model.model.layers...``), so we match on the trailing name rather than a fixed prefix.
+    ``AutoModelForCausalLM`` resolves this checkpoint to the text-only ``Qwen3_5ForCausalLM``
+    (``model.*``), while vLLM loads ``Qwen3_5ForConditionalGeneration``, whose checkpoint nests
+    the text model under ``model.language_model.*``. Sending checkpoint names (rather than vLLM
+    parameter names) lets vLLM apply its own HF->vLLM mapping and packed/fused projections.
     """
-    mapping: dict[str, str] = {}
-    for hf_name in hf_names:
-        matches = [v for v in vllm_names if v == hf_name or v.endswith("." + hf_name)]
-        if matches:
-            mapping[hf_name] = min(matches, key=len)
-    return mapping
-
-
-def _get_vllm_parameter_names(worker) -> list[str]:
-    return [name for name, _ in worker.model_runner.get_model().named_parameters()]
+    if hf_name.startswith("model."):
+        return "model.language_model." + hf_name[len("model.") :]
+    return hf_name
 
 
 @dataclass
@@ -61,6 +59,8 @@ class VLLMRolloutEngine:
             "enforce_eager": params.vllm_enforce_eager,
             "seed": params.vllm_seed,
         }
+        if params.vllm_language_model_only:
+            kwargs["language_model_only"] = True
         if params.vllm_kv_cache_bytes is not None:
             kwargs["kv_cache_memory_bytes"] = params.vllm_kv_cache_bytes
 
@@ -71,31 +71,33 @@ class VLLMRolloutEngine:
             max_tokens=params.max_tokens_per_turn,
             stop_token_ids=[tokenizer.convert_tokens_to_ids("<|im_end|>")],
         )
-        self._name_map: dict[str, str] | None = None
 
     def sync_weights(self, policy_model) -> None:
-        """Copy the trainer's parameters into the vLLM model (in-process, via ``collective_rpc``)."""
-        if self._name_map is None:
-            vllm_names = self.llm.collective_rpc(_get_vllm_parameter_names)[0]
-            hf_names = [name for name, _ in policy_model.named_parameters()]
-            self._name_map = match_weight_names(vllm_names, hf_names)
+        """Copy the trainer's parameters into the vLLM model (in-process, via ``collective_rpc``).
 
-        weights = [
-            (self._name_map[name], param.detach())
-            for name, param in policy_model.named_parameters()
-            if name in self._name_map
-        ]
+        Weights are sent in checkpoint layout so vLLM's ``load_weights`` applies its HF->vLLM
+        mapping and fuses/stacks packed projections (qkv, gate_up, GDN in_proj) itself.
+        """
+        weights = [(checkpoint_name(name), param.detach()) for name, param in policy_model.named_parameters()]
         self.llm.collective_rpc("reload_weights", args=(weights,))
 
     def generate_for_envs(
-        self, envs: list[GuessTheNumberEnv], params: Parameters
+        self,
+        envs: list[GuessTheNumberEnv],
+        params: Parameters,
+        max_concurrency: int | None = None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[RolloutMetrics]]:
-        """Batched multi-turn rollouts, capped at ``rollout_batch_size`` concurrent envs.
+        """Batched multi-turn rollouts, capped at ``max_concurrency`` concurrent envs.
 
-        Envs are processed in chunks so the peak number of in-flight sequences (and therefore KV cache)
-        stays bounded regardless of how many rollouts the step wants.
+        ``None`` (or a non-positive value) means no cap: every env is submitted in one chunk.
+        Training passes ``rollout_batch_size``; eval passes ``eval_rollout_batch_size`` (``None``
+        by default) so all targets run together. Metrics are returned in the input env order.
         """
-        max_concurrency = params.rollout_batch_size
+        if not envs:
+            return [], [], []
+
+        if max_concurrency is None or max_concurrency <= 0:
+            max_concurrency = len(envs)
 
         token_seq_lst: list[torch.Tensor] = []
         output_mask_lst: list[torch.Tensor] = []

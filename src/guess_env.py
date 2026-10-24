@@ -55,11 +55,13 @@ class GuessTheNumberEnv:
         self.target = target
 
         self.initial_message = "Enter your first guess to start the game!"
-        self.system_prompt = "You are playing Guess The Number with the user. The user has a target number between " \
-        f"{config.min_number} and {config.max_number} (inclusive) and you have to guess it as fast as possible."
-        "When you enter a guess, the user will tell you if the target number is 'higher' or 'lower'. "
-        "When answering, only the number that is wrapped inside \\boxed{} will be considered as your guess, "
-        "for example, \\boxed{1}. Follow that exact format for your final answer."
+        self.system_prompt = (
+            "You are playing Guess The Number with the user. The user has a target number between "
+            f"{config.min_number} and {config.max_number} (inclusive) and you have to guess it as fast as possible. "
+            "When you enter a guess, the user will tell you if the target number is 'higher' or 'lower'. "
+            "When answering, only the number that is wrapped inside \\boxed{} will be considered as your guess, "
+            "for example, \\boxed{1}. Follow that exact format for your final answer."
+        )
 
         self.turn_count: int = 0
         self.previous_guesses: set[int] = set()
