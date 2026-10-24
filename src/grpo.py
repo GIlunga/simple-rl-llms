@@ -15,13 +15,20 @@ from rich.text import Text
 from rich.tree import Tree
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
+from transformers.generation import (
+    MinPLogitsWarper,
+    RepetitionPenaltyLogitsProcessor,
+    TemperatureLogitsWarper,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
+)
 
 from guess_env import EnvConfig, GuessTheNumberEnv, RolloutMetrics, aggregate_env_metrics, aggregate_quality_metrics
 from vllm_rollout import VLLMRolloutEngine
 
 if TYPE_CHECKING:
-    from train import Parameters
+    from train import Parameters, SamplingConfig
 
 # Disable annoying prints
 warnings.filterwarnings("ignore", message=".*tl.make_block_ptr is deprecated.*")
@@ -85,6 +92,44 @@ def print_rollouts(
 
 
 # Actual GRPO algo
+class _PresencePenaltyLogitsProcessor(LogitsProcessor):
+    """OpenAI-style presence penalty with vLLM's scope: only tokens generated in this call are penalized."""
+
+    def __init__(self, penalty: float, prompt_len: int) -> None:
+        self.penalty = penalty
+        self.prompt_len = prompt_len
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        generated = input_ids[:, self.prompt_len :]
+        seen = torch.zeros_like(scores, dtype=torch.bool)
+        if generated.numel():
+            seen.scatter_(1, generated, True)
+        return scores - self.penalty * seen.to(scores.dtype)
+
+
+def sampling_logits_processor(sampling: SamplingConfig, prompt_len: int) -> LogitsProcessorList:
+    """Apply the resolved sampling config in vLLM's order.
+
+    ``generate`` always applies its own warpers (temperature, top_k, top_p, min_p) in transformers' order and
+    before any custom processor, so the caller neutralizes them and this chain reproduces vLLM's pipeline:
+    repetition/presence penalties -> temperature -> min_p -> top_k -> top_p.
+    """
+    processors: list[LogitsProcessor] = []
+    if sampling.repetition_penalty != 1.0:
+        processors.append(RepetitionPenaltyLogitsProcessor(sampling.repetition_penalty))
+    if sampling.presence_penalty != 0.0:
+        processors.append(_PresencePenaltyLogitsProcessor(sampling.presence_penalty, prompt_len))
+    if sampling.temperature != 1.0:
+        processors.append(TemperatureLogitsWarper(sampling.temperature))
+    if sampling.min_p > 0.0:
+        processors.append(MinPLogitsWarper(sampling.min_p))
+    if sampling.top_k > 0:
+        processors.append(TopKLogitsWarper(sampling.top_k))
+    if sampling.top_p < 1.0:
+        processors.append(TopPLogitsWarper(sampling.top_p))
+    return LogitsProcessorList(processors)
+
+
 def generate_single_rollout(
     env: GuessTheNumberEnv,
     model: AutoModelForCausalLM,
@@ -110,17 +155,25 @@ def generate_single_rollout(
     im_end_token = tokenizer.convert_tokens_to_ids("<|im_end|>")
 
     # Iterate multi-step env
+    sampling = params.sampling()
     while True:
         with torch.inference_mode():
             output_dict = model.generate(
                 **inputs,
                 max_new_tokens=max_tokens_per_turn,
-                temperature=params.temperature,
                 do_sample=True,
                 use_cache=True,
                 return_dict_in_generate=True,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=[tokenizer.eos_token_id, im_end_token],
+                # Neutralize generate's built-in warpers; sampling_logits_processor applies the resolved config
+                # in vLLM's order so the fallback matches the vLLM path instead of transformers' defaults.
+                temperature=1.0,
+                top_k=0,
+                top_p=1.0,
+                min_p=None,
+                repetition_penalty=1.0,
+                logits_processor=sampling_logits_processor(sampling, inputs["input_ids"].shape[1]),
             )
 
         # Strip end of text for next turn
@@ -178,13 +231,14 @@ def get_rollouts(
     ]
 
     if engine is not None:
-        token_seq_lst, output_mask_lst, metrics_lst = engine.generate_for_envs(
+        token_seq_lst, output_mask_lst, vllm_logprob_lst, metrics_lst = engine.generate_for_envs(
             envs, params, max_concurrency=params.rollout_batch_size
         )
     else:
         token_seq_lst = []
         output_mask_lst = []
         metrics_lst = []
+        vllm_logprob_lst = None
         for env in envs:
             token_seq, output_mask, _ = generate_single_rollout(
                 env, policy_model, tokenizer, max_tokens_per_turn, params
@@ -230,6 +284,9 @@ def get_rollouts(
         "Rollout Len/max": rollout_lens.max().item(),
         "Rollout Len/min": rollout_lens.min().item(),
     }
+    if vllm_logprob_lst is not None:
+        vllm_logprobs = torch.nn.utils.rnn.pad_sequence(vllm_logprob_lst, batch_first=True)
+        dataset_metrics |= logprob_gap_metrics(vllm_logprobs, gen_policy_logprobs, loss_mask)
 
     # Print rollouts to stdout
     print_rollouts(
@@ -300,7 +357,9 @@ def evaluate_test_set(
     with tqdm(total=total_rollouts, desc="Test set rollouts") as progress:
         if engine is not None:
             print(f"[eval] generating {total_rollouts} rollouts in one batch", flush=True)
-            _, _, metrics_lst = engine.generate_for_envs(envs, params, max_concurrency=params.eval_rollout_batch_size)
+            _, _, _, metrics_lst = engine.generate_for_envs(
+                envs, params, max_concurrency=params.eval_rollout_batch_size
+            )
             progress.update(total_rollouts)
         else:
             metrics_lst = []
@@ -409,6 +468,28 @@ def get_logprobs_from_logits(model_output, targets):
     return -F.cross_entropy(flat_logits, flat_targets, reduction="none").reshape(
         shifted_logits.shape[0], shifted_logits.shape[1]
     )
+
+
+def logprob_gap_metrics(
+    vllm_logprobs: torch.Tensor, hf_logprobs: torch.Tensor, loss_mask: torch.Tensor
+) -> dict[str, float]:
+    """Discrepancy between vLLM's sampler logprobs and the HF forward on the same tokens.
+
+    vLLM returns raw (pre-temperature) logprobs and ``get_logprobs_from_rollouts`` recomputes raw
+    logprobs, so the two should agree up to kernel/precision noise. A large systematic gap means the
+    weights synced into vLLM are stale or wrong (that failure is otherwise silent).
+
+    ``hf_logprobs[:, i]`` scores ``token_seqs[:, i + 1]``, so it lines up with ``vllm_logprobs[:, i + 1]``.
+    """
+    generated = loss_mask[:, 1:].bool()
+    gap = (hf_logprobs.float() - vllm_logprobs[:, 1:])[generated]
+    if gap.numel() == 0:
+        return {}
+    return {
+        "Logprob gap/mean abs": gap.abs().mean().item(),
+        "Logprob gap/mean signed": gap.mean().item(),
+        "Logprob gap/max abs": gap.abs().max().item(),
+    }
 
 
 def create_wsd_scheduler(optimizer, total_steps, params: Parameters):

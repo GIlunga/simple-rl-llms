@@ -10,11 +10,40 @@ from guess_env import EnvConfig
 
 
 @dataclass(frozen=True)
+class SamplingConfig:
+    """Fully resolved rollout sampling knobs, shared by the vLLM and HF rollout paths."""
+
+    temperature: float
+    top_p: float
+    top_k: int
+    min_p: float
+    presence_penalty: float
+    repetition_penalty: float
+
+
+# Qwen3.5's recommended sampling settings for text tasks, per thinking mode.
+_QWEN_SAMPLING: dict[bool, SamplingConfig] = {
+    False: SamplingConfig(
+        temperature=1.0, top_p=1.0, top_k=20, min_p=0.0, presence_penalty=2.0, repetition_penalty=1.0
+    ),
+    True: SamplingConfig(
+        temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=1.5, repetition_penalty=1.0
+    ),
+}
+
+
+@dataclass(frozen=True)
 class Parameters:
     # Model/image settings
     model_name: str = MODEL_NAME
     use_thinking: bool = False
-    temperature: float = 0.4
+    # Sampling knobs: None = use Qwen's recommendation for the current thinking mode (see _QWEN_SAMPLING).
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
     gpu: str = "L4"
     dtype: torch.dtype = torch.bfloat16
     timeout: int = 900  # seconds
@@ -73,6 +102,22 @@ class Parameters:
     eval_rollout_batch_size: int | None = None
     eval_pass_at_k: tuple[int, ...] = (1, 2, 4, 8, 16)
 
+    def sampling(self) -> SamplingConfig:
+        """Resolve the rollout sampling knobs: explicit values win, unset ones fall back to Qwen's recommendation."""
+        recommended = _QWEN_SAMPLING[self.use_thinking]
+        return SamplingConfig(
+            temperature=self.temperature if self.temperature is not None else recommended.temperature,
+            top_p=self.top_p if self.top_p is not None else recommended.top_p,
+            top_k=self.top_k if self.top_k is not None else recommended.top_k,
+            min_p=self.min_p if self.min_p is not None else recommended.min_p,
+            presence_penalty=(
+                self.presence_penalty if self.presence_penalty is not None else recommended.presence_penalty
+            ),
+            repetition_penalty=(
+                self.repetition_penalty if self.repetition_penalty is not None else recommended.repetition_penalty
+            ),
+        )
+
 
 params = Parameters()
 
@@ -102,7 +147,12 @@ def run_local() -> None:
         reward_breakdown_turns=params.reward_breakdown_turns,
     )
 
-    wandb_run = wandb.init(project=params.wandb_project, name=params.wandb_run_name, config=asdict(params))
+    wandb_run = wandb.init(
+        project=params.wandb_project,
+        name=params.wandb_run_name,
+        # Unset knobs are logged with the resolved Qwen recommendation, so a run records what it actually sampled with.
+        config=asdict(params) | asdict(params.sampling()),
+    )
 
     try:
         train(params, env_config, wandb_run)

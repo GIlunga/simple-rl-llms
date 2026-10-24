@@ -41,6 +41,7 @@ class _Rollout:
     env: GuessTheNumberEnv
     token_ids: list[int]
     loss_mask: list[bool]
+    token_logprobs: list[float]  # vLLM's logprob for each generated token, 0.0 elsewhere
     done: bool = False
 
 
@@ -66,10 +67,19 @@ class VLLMRolloutEngine:
 
         self.llm = LLM(**kwargs)
         self.tokenizer = tokenizer
+        sampling = params.sampling()
         self.sampling_params = SamplingParams(
-            temperature=params.temperature,
+            temperature=sampling.temperature,
+            top_p=sampling.top_p,
+            top_k=sampling.top_k,
+            min_p=sampling.min_p,
+            presence_penalty=sampling.presence_penalty,
+            repetition_penalty=sampling.repetition_penalty,
             max_tokens=params.max_tokens_per_turn,
             stop_token_ids=[tokenizer.convert_tokens_to_ids("<|im_end|>")],
+            # Only the sampled token's logprob ("raw" mode by default: pre-temperature), for the sync check
+            # in grpo.logprob_gap_metrics.
+            logprobs=0,
         )
 
     def sync_weights(self, policy_model) -> None:
@@ -86,40 +96,45 @@ class VLLMRolloutEngine:
         envs: list[GuessTheNumberEnv],
         params: Parameters,
         max_concurrency: int | None = None,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[RolloutMetrics]]:
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[RolloutMetrics]]:
         """Batched multi-turn rollouts, capped at ``max_concurrency`` concurrent envs.
 
         ``None`` (or a non-positive value) means no cap: every env is submitted in one chunk.
         Training passes ``rollout_batch_size``; eval passes ``eval_rollout_batch_size`` (``None``
-        by default) so all targets run together. Metrics are returned in the input env order.
+        by default) so all targets run together. Sequences, masks, per-token vLLM logprobs, and
+        metrics are returned in the input env order.
         """
         if not envs:
-            return [], [], []
+            return [], [], [], []
 
         if max_concurrency is None or max_concurrency <= 0:
             max_concurrency = len(envs)
 
         token_seq_lst: list[torch.Tensor] = []
         output_mask_lst: list[torch.Tensor] = []
+        logprob_lst: list[torch.Tensor] = []
         metrics_lst: list[RolloutMetrics] = []
         for start in range(0, len(envs), max_concurrency):
-            chunk_seqs, chunk_masks, chunk_metrics = self._generate_chunk(envs[start : start + max_concurrency], params)
+            chunk_seqs, chunk_masks, chunk_logprobs, chunk_metrics = self._generate_chunk(
+                envs[start : start + max_concurrency], params
+            )
             token_seq_lst.extend(chunk_seqs)
             output_mask_lst.extend(chunk_masks)
+            logprob_lst.extend(chunk_logprobs)
             metrics_lst.extend(chunk_metrics)
 
-        return token_seq_lst, output_mask_lst, metrics_lst
+        return token_seq_lst, output_mask_lst, logprob_lst, metrics_lst
 
     def _generate_chunk(
         self, envs: list[GuessTheNumberEnv], params: Parameters
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[RolloutMetrics]]:
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[RolloutMetrics]]:
         """One generation call per turn across the chunk's still-running envs."""
         from vllm import TokensPrompt
 
         rollouts = []
         for env in envs:
             prompt_ids = self._initial_prompt_ids(env, params)
-            rollouts.append(_Rollout(env, prompt_ids, [False] * len(prompt_ids)))
+            rollouts.append(_Rollout(env, prompt_ids, [False] * len(prompt_ids), [0.0] * len(prompt_ids)))
 
         while True:
             active = [r for r in rollouts if not r.done]
@@ -133,9 +148,24 @@ class VLLMRolloutEngine:
             )
 
             for rollout, output in zip(active, outputs, strict=True):
-                generated_ids = list(output.outputs[0].token_ids)
+                completion = output.outputs[0]
+                generated_ids = list(completion.token_ids)
+                if len(completion.logprobs) != len(generated_ids):
+                    raise ValueError(
+                        f"vLLM returned {len(completion.logprobs)} logprob entries for "
+                        f"{len(generated_ids)} generated tokens"
+                    )
+                generated_logprobs = [
+                    float(entry[token_id].logprob) for token_id, entry in zip(generated_ids, completion.logprobs)
+                ]
+                # Mirror the HF path (grpo.generate_single_rollout): <|im_end|> is the turn separator, so a
+                # trailing <|endoftext|> must not be carried into the next turn's prompt.
+                if generated_ids and generated_ids[-1] == self.tokenizer.eos_token_id:
+                    generated_ids.pop()
+                    generated_logprobs.pop()
                 rollout.token_ids.extend(generated_ids)
                 rollout.loss_mask.extend([True] * len(generated_ids))
+                rollout.token_logprobs.extend(generated_logprobs)
 
                 text_response = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
                 result = rollout.env.step(text_response)
@@ -147,11 +177,13 @@ class VLLMRolloutEngine:
                 observation_ids = self._observation_ids(result.observation)
                 rollout.token_ids.extend(observation_ids)
                 rollout.loss_mask.extend([False] * len(observation_ids))
+                rollout.token_logprobs.extend([0.0] * len(observation_ids))
 
         token_seq_lst = [torch.tensor(r.token_ids) for r in rollouts]
         output_mask_lst = [torch.tensor(r.loss_mask) for r in rollouts]
+        logprob_seq_lst = [torch.tensor(r.token_logprobs, dtype=torch.float32) for r in rollouts]
         metrics_lst = [r.env.rollout_metrics() for r in rollouts]
-        return token_seq_lst, output_mask_lst, metrics_lst
+        return token_seq_lst, output_mask_lst, logprob_seq_lst, metrics_lst
 
     def _initial_prompt_ids(self, env: GuessTheNumberEnv, params: Parameters) -> list[int]:
         messages = [
